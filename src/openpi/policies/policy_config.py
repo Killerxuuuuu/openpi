@@ -1,3 +1,4 @@
+import dataclasses
 import logging
 import os
 import pathlib
@@ -51,8 +52,21 @@ def create_trained_policy(
 
     logging.info("Loading model...")
     if is_pytorch:
+        if (checkpoint_dir / "da_ptq.json").is_file():
+            # Calibrated wrappers/scales are restored below. Start in eager mode
+            # rather than capturing the unwrapped sampler in a compiled graph.
+            train_config = dataclasses.replace(
+                train_config, model=dataclasses.replace(train_config.model, pytorch_compile_mode=None)
+            )
         model = train_config.model.load_pytorch(train_config, weight_path)
         model.paligemma_with_expert.to_bfloat16_for_selected_params("bfloat16")
+        # DA-PTQ artifacts retain standard floating weights and add a sidecar
+        # containing A8 scales and any fused biases. Restore after dtype casting;
+        # already-quantized weights must never be quantized for a second time.
+        if (checkpoint_dir / "da_ptq.json").is_file():
+            from openpi.quantization.checkpoint import restore_quantization
+
+            restore_quantization(model, checkpoint_dir)
     else:
         model = train_config.model.load(_model.restore_params(checkpoint_dir / "params", dtype=jnp.bfloat16))
     data_config = train_config.data.create(train_config.assets_dirs, train_config.model)

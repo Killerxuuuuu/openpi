@@ -314,9 +314,11 @@ class PI0Pytorch(nn.Module):
 
         return embs, pad_masks, att_masks, adarms_cond
 
-    def forward(self, observation, actions, noise=None, time=None) -> Tensor:
+    def forward(self, observation, actions, noise=None, time=None, *, train=True) -> Tensor:
         """Do a full training forward pass and compute the loss (batch_size x num_steps x num_motors)"""
-        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=True)
+        # Calibration uses train=False to preserve evaluation preprocessing while
+        # keeping the forward differentiable. Existing training calls are unchanged.
+        images, img_masks, lang_tokens, lang_masks, state = self._preprocess_observation(observation, train=train)
 
         if noise is None:
             noise = self.sample_noise(actions.shape, actions.device)
