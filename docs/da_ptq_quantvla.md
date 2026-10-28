@@ -119,6 +119,79 @@ COMMON=(
 
 该正式测评命令**不会再校准**。用 `--stage all` 可在同一调用中校准缺失变体后评估；完整产物会检查 config、source 路径和 selection，一致才复用。源权重和数据必须保持不变，路径校验不等于内容哈希验证。改位宽、保护范围、预算、CSRC 或 matching 参数时用新的 `--output-dir`。`--stage evaluate` 遇到缺失/不匹配校准会报错。
 
+## 每卡多个模型并发
+
+增加 `--workers-per-gpu 3`，允许 6、7 号卡每卡同时运行最多三个独立模型。默认五个变体分配如下；若添加 `--include-bf16`，第六个 worker 同时评估原始 BF16，无需校准它。
+
+| GPU | worker 0 | worker 1 | worker 2 |
+| --- | --- | --- | --- |
+| 6 | DA-PTQ | random seed 0 | random seed 2 |
+| 7 | equal weight | random seed 1 | BF16（可选） |
+
+```bash
+# 尚未开始校准时：新启动的校准可以直接五个变体并发
+.venv/bin/python -u scripts/run_da_ptq_controls.py "${COMMON[@]}" \
+  --workers-per-gpu 3 --stage calibrate
+
+# 完整校准已保存后：并发正式测评，复用原有产物
+nohup .venv/bin/python -u scripts/run_da_ptq_controls.py "${COMMON[@]}" \
+  --workers-per-gpu 3 --stage evaluate \
+  --num-trials 50 --seeds 7 --save-video --video-max-trials 2 \
+  > "$RUNS/formal_launcher.log" 2>&1 &
+```
+
+端口自动独立分配（默认2414起），日志为 `gpu6_worker0.log` 等，评估结果在相同名字的子目录。worker数只影响调度，不改变校准参数，已有完整产物可直接复用。默认五个变体只有五个活跃worker；添加BF16才会用满六个。
+
+正在运行的旧launcher不会动态增加worker；**不要对同一校准目录重复启动第二套任务**。可让当前校准完成，再使用上面的并发测评。并发会同时增加CPU渲染与主存负载，总体耗时需要实际观察，不能保证随worker数线性缩短。
+
+## 已完成校准：4、5、6、7号卡各3个实例
+
+仅设置更多GPU/worker时，五个模型最多只有五个活跃实例。加 `--split-suites` 后，五个模型 × 四个suite变成20个独立评估任务，由12个GPU槽位动态领取；长suite优先，完成一个再取下一个。每个模型/suite只执行一次，50 trials/任务和配对seed保持不变。此模式只支持 `--stage evaluate`，不会加载校准数据或重新校准。
+
+更新代码后，在已配置好OSMesa的服务器执行（`RUNS`必须指向已校准的目录，不要创建新的校准根目录）：
+
+```bash
+cd /home/xusiyuan/openpi
+conda activate libero-cpython
+export LIBERO_PYTHON="$CONDA_PREFIX/bin/python"
+export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export LIBERO_CONFIG_PATH="$PWD/.libero_config"
+export MUJOCO_GL=osmesa
+export PYOPENGL_PLATFORM=osmesa
+export LIBGL_ALWAYS_SOFTWARE=1
+export LP_NUM_THREADS=2
+export OMP_NUM_THREADS=2
+export JAX_PLATFORMS=cpu
+export XLA_PYTHON_CLIENT_PREALLOCATE=false
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
+export PYTHONPATH="$PWD/src:$PWD/packages/openpi-client/src${PYTHONPATH:+:$PYTHONPATH}"
+export PTQ_DATA_ROOT=/data2/xusiyuan
+export RUNS="$PTQ_DATA_ROOT/runs/quantvla_controls_v2"
+
+LOG="$RUNS/launcher_12workers_$(date +%Y%m%d_%H%M%S).log"
+nohup .venv/bin/python -u scripts/run_da_ptq_controls.py \
+  --checkpoint-dir "$PTQ_DATA_ROOT/checkpoints/pi05_libero_pytorch" \
+  --dataset-root "$PTQ_DATA_ROOT/datasets/physical-intelligence/libero" \
+  --output-dir "$RUNS" --eval-python "$LIBERO_PYTHON" \
+  --stage evaluate --split-suites \
+  --gpus 4 5 6 7 --workers-per-gpu 3 --base-port 2514 \
+  --num-trials 50 --seeds 7 --save-video --video-max-trials 2 \
+  > "$LOG" 2>&1 &
+echo "Launcher PID: $!"
+echo "Launcher log: $LOG"
+```
+
+上述量化设置使用本页标准默认值；若校准时改过量化参数，仍需传入相同参数。五个变体总计10,000 episodes，与分片前完全相同。`--include-bf16`是额外的完整BF16对照，增加到24个分片/12,000 episodes，并非自动必选。
+
+```bash
+LOG_DIR=$(ls -dt "$RUNS"/evaluation_* | head -n 1)
+tail -n 30 -F "$LOG_DIR"/gpu*_worker*.log
+# 总汇总：$LOG_DIR/results.json
+# 分片/视频：$LOG_DIR/shards/<variant>__<suite>/<variant>/<suite>/
+```
+
+GPU测得单实例8GB是当前占用，不等于全程峰值；每卡3个实例按该观测约24GB，保留余量。12个实例同时运行CPU渲染，线程先设为每进程2个，观察CPU利用率/吞吐再调整。并行评估的延迟不能作为独占GPU的推理效率对比。新评估目录不恢复旧评估中的部分episode；不要同时启动同一比较组的另一套正式测评。
+
 ```text
 quantvla_controls_v2/
   quantized/

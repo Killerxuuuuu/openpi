@@ -11,6 +11,7 @@ import datetime
 import json
 import os
 from pathlib import Path
+import queue
 import subprocess
 import sys
 
@@ -22,7 +23,9 @@ def parser():
     result = quantization_parser()
     result.description = __doc__
     result.add_argument("--stage", choices=["calibrate", "evaluate", "all"], default="all")
-    result.add_argument("--gpus", nargs="+", type=int, default=[6, 7], help="Physical CUDA indices, one worker each")
+    result.add_argument("--gpus", nargs="+", type=int, default=[6, 7], help="Physical CUDA indices")
+    result.add_argument("--workers-per-gpu", type=int, default=1, help="Independent simultaneous models per GPU")
+    result.add_argument("--split-suites", action="store_true", help="Evaluate model/suite pairs through a shared queue")
     result.add_argument(
         "--variants", nargs="+", default=["da_ptq", "equal_weight", "random_seed_0", "random_seed_1", "random_seed_2"]
     )
@@ -44,6 +47,17 @@ def plans(args):
         raise ValueError("Use --variants to select jobs; leave --mode at all")
     if not args.gpus or len(set(args.gpus)) != len(args.gpus) or min(args.gpus) < 0:
         raise ValueError("GPU indices must be nonnegative and distinct")
+    if args.workers_per_gpu < 1:
+        raise ValueError("workers-per-gpu must be positive")
+    if args.split_suites and args.stage != "evaluate":
+        raise ValueError("--split-suites requires --stage evaluate; calibrate models first")
+    if len(set(args.suites)) != len(args.suites) or not set(args.suites) <= {
+        "libero_spatial",
+        "libero_object",
+        "libero_goal",
+        "libero_10",
+    }:
+        raise ValueError("Suites must be distinct supported LIBERO suites")
     if len(set(args.variants)) != len(args.variants):
         raise ValueError("Variants must be distinct")
     available = dict(configurations(args))
@@ -53,9 +67,140 @@ def plans(args):
         raise ValueError("No jobs requested")
     if args.num_trials < 1 or args.video_max_trials < 0 or len(set(args.seeds)) != len(args.seeds):
         raise ValueError("Invalid evaluation counts/seeds")
-    if args.base_port < 1024 or args.base_port + len(args.gpus) - 1 > 65535:
+    if args.base_port < 1024 or args.base_port + len(args.gpus) * args.workers_per_gpu - 1 > 65535:
         raise ValueError("Invalid policy ports")
     return {name: available[name] for name in args.variants}
+
+
+def worker_layout(args, jobs):
+    """Round-robin models over devices, then fill additional slots per device."""
+    if args.split_suites:
+        count = min(len(args.gpus) * args.workers_per_gpu, len(evaluation_cells(args, jobs)))
+        return [
+            {
+                "gpu": args.gpus[offset % len(args.gpus)],
+                "slot": offset // len(args.gpus),
+                "label": f"gpu{args.gpus[offset % len(args.gpus)]}_worker{offset // len(args.gpus)}",
+                "variants": [],
+                "queue": "model_suite_pairs",
+                "port": args.base_port + offset,
+            }
+            for offset in range(count)
+        ]
+    count = len(args.gpus) * args.workers_per_gpu
+    groups = [list(jobs)[offset::count] for offset in range(count)]
+    # Use an otherwise idle slot for BF16 when possible, rather than queue it
+    # in front of a quantized model on the same worker.
+    bf16_slot = next((offset for offset, names in enumerate(groups) if not names), 0)
+    workers = []
+    for offset, names in enumerate(groups):
+        gpu, slot = args.gpus[offset % len(args.gpus)], offset // len(args.gpus)
+        include_bf16 = args.include_bf16 and offset == bf16_slot and args.stage != "calibrate"
+        if not names and not include_bf16:
+            continue
+        workers.append(
+            {
+                "gpu": gpu,
+                "slot": slot,
+                "label": f"gpu{gpu}" if args.workers_per_gpu == 1 else f"gpu{gpu}_worker{slot}",
+                "variants": names,
+                "include_bf16": include_bf16,
+                "port": args.base_port + offset,
+            }
+        )
+    return workers
+
+
+def evaluation_cells(args, jobs):
+    # Long suites first to reduce the final tail when faster workers finish.
+    order = ["libero_10", "libero_goal", "libero_object", "libero_spatial"]
+    names = list(jobs) + (["bf16"] if args.include_bf16 else [])
+    return [(name, suite) for suite in order if suite in args.suites for name in names]
+
+
+def merge_suite_results(cells, completed):
+    if set(completed) != set(cells):
+        raise RuntimeError("Incomplete/extra model-suite evaluations")
+    results = {}
+    for (name, suite), rate in completed.items():
+        results.setdefault(name, {"suite_success_rates": {}})["suite_success_rates"][suite] = rate
+    for result in results.values():
+        values = list(result["suite_success_rates"].values())
+        result["average"] = sum(values) / len(values)
+    return results
+
+
+def run_split_evaluation(args, jobs, workers, root, invocation, quantized, checkpoint):
+    """Each queue item is evaluated once, with one policy server per GPU slot."""
+    cells = evaluation_cells(args, jobs)
+    pending = queue.Queue()
+    for cell in cells:
+        pending.put(cell)
+
+    def worker(layout):
+        label = layout["label"]
+        environment = {
+            **os.environ,
+            "CUDA_VISIBLE_DEVICES": str(layout["gpu"]),
+            "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
+            "JAX_PLATFORMS": "cpu",
+            "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
+            "PYTHONUNBUFFERED": "1",
+        }
+        completed = {}
+        with (invocation / f"{label}.log").open("w", encoding="utf-8") as log:
+            while True:
+                try:
+                    name, suite = pending.get_nowait()
+                except queue.Empty:
+                    return completed
+                destination = invocation / "shards" / f"{name}__{suite}"
+                message = f"{label}: START {name}/{suite}; output={destination}"
+                print(message, flush=True)
+                print(message, file=log, flush=True)
+                command = [
+                    sys.executable,
+                    "-u",
+                    str(root / "scripts/evaluate_da_ptq_matrix.py"),
+                    "--runs-dir",
+                    str(quantized),
+                    "--output-dir",
+                    str(destination),
+                    "--variants",
+                    *([] if name == "bf16" else [name]),
+                    "--eval-python",
+                    str(args.eval_python.resolve()),
+                    "--num-trials",
+                    str(args.num_trials),
+                    "--seeds",
+                    *map(str, args.seeds),
+                    "--suites",
+                    suite,
+                    "--port",
+                    str(layout["port"]),
+                    "--device",
+                    "cuda:0",
+                ]
+                if name == "bf16":
+                    command.extend(["--bf16-checkpoint", str(checkpoint)])
+                if args.save_video:
+                    command.extend(["--save-video", "--video-max-trials", str(args.video_max_trials)])
+                subprocess.run(command, cwd=root, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True)
+                result = json.loads((destination / "results.json").read_text(encoding="utf-8"))
+                rates = result[name]["suite_success_rates"]
+                if set(result) != {name} or set(rates) != {suite}:
+                    raise RuntimeError(f"Unexpected evaluation result: {destination}")
+                completed[name, suite] = rates[suite]
+                print(f"{label}: DONE {name}/{suite}", flush=True)
+                pending.task_done()
+
+    completed = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(workers)) as executor:
+        for subset in executor.map(worker, workers):
+            if completed.keys() & subset.keys():
+                raise RuntimeError("Duplicate model-suite evaluation")
+            completed.update(subset)
+    return merge_suite_results(cells, completed)
 
 
 def validate_artifact(directory, config, checkpoint, dataset, selection):
@@ -116,16 +261,21 @@ def calibration_command(args, name, config, root, selection):
 def main(argv=None):
     args = parser().parse_args(argv)
     jobs = plans(args)
-    groups = [list(jobs)[offset :: len(args.gpus)] for offset in range(len(args.gpus))]
+    workers = worker_layout(args, jobs)
     if args.dry_run:
         print(
             json.dumps(
                 {
                     "stage": args.stage,
                     "render_backend": os.environ.get("MUJOCO_GL"),
-                    "groups": dict(zip(map(str, args.gpus), groups, strict=True)),
+                    "groups": {
+                        str(worker["gpu"]) if args.workers_per_gpu == 1 else worker["label"]: worker["variants"]
+                        for worker in workers
+                    },
+                    "workers": workers,
                     "jobs": {name: config.to_dict() for name, config in jobs.items()},
                     "include_bf16": args.include_bf16,
+                    "evaluation_cells": evaluation_cells(args, jobs) if args.split_suites else None,
                 },
                 indent=2,
             )
@@ -198,14 +348,21 @@ def main(argv=None):
                     key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()
                 },
                 "configurations": {name: config.to_dict() for name, config in jobs.items()},
+                "workers": workers,
+                "evaluation_cells": evaluation_cells(args, jobs) if args.split_suites else None,
             },
             indent=2,
         ),
         encoding="utf-8",
     )
+    if args.split_suites:
+        results = run_split_evaluation(args, jobs, workers, root, invocation, quantized, checkpoint)
+        (invocation / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
+        print(f"Completed. Reused artifacts: {quantized}; logs/results: {invocation}", flush=True)
+        return
 
-    def worker(offset):
-        gpu, names = args.gpus[offset], groups[offset]
+    def worker(layout):
+        gpu, names, label = layout["gpu"], layout["variants"], layout["label"]
         environment = {
             **os.environ,
             "CUDA_VISIBLE_DEVICES": str(gpu),
@@ -214,19 +371,19 @@ def main(argv=None):
             "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
             "PYTHONUNBUFFERED": "1",
         }
-        with (invocation / f"gpu{gpu}.log").open("w", encoding="utf-8") as log:
+        with (invocation / f"{label}.log").open("w", encoding="utf-8") as log:
 
             def run(command):
-                print(f"GPU {gpu}: {' '.join(command)}", flush=True)
+                print(f"{label}: {' '.join(command)}", flush=True)
                 subprocess.run(command, cwd=root, env=environment, stdout=log, stderr=subprocess.STDOUT, check=True)
 
             for name in names:
                 if name in pending:
                     run(calibration_command(args, name, jobs[name], root, selection_path))
                     validate_artifact(quantized / name, jobs[name], checkpoint, dataset, selection)
-            if args.stage == "calibrate" or (not names and not (args.include_bf16 and offset == 0)):
+            if args.stage == "calibrate":
                 return {}
-            destination = invocation / f"gpu{gpu}"
+            destination = invocation / label
             command = [
                 sys.executable,
                 "-u",
@@ -246,11 +403,11 @@ def main(argv=None):
                 "--suites",
                 *args.suites,
                 "--port",
-                str(args.base_port + offset),
+                str(layout["port"]),
                 "--device",
                 "cuda:0",
             ]
-            if args.include_bf16 and offset == 0:
+            if layout["include_bf16"]:
                 command.extend(["--bf16-checkpoint", str(checkpoint)])
             if args.save_video:
                 command.extend(["--save-video", "--video-max-trials", str(args.video_max_trials)])
@@ -258,8 +415,8 @@ def main(argv=None):
             return json.loads((destination / "results.json").read_text(encoding="utf-8"))
 
     results = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(args.gpus)) as executor:
-        for result in executor.map(worker, range(len(args.gpus))):
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(workers)) as executor:
+        for result in executor.map(worker, workers):
             results.update(result)
     if args.stage != "calibrate":
         (invocation / "results.json").write_text(json.dumps(results, indent=2), encoding="utf-8")
