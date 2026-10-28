@@ -28,7 +28,15 @@ def test_matrix_dry_run_without_model_or_dataset(tmp_path):
         check=True,
     )
     jobs = json.loads(result.stdout)
-    assert set(jobs) == {"uniform", "da_ptq", "equal_weight", "random_seed_0", "random_seed_1", "random_seed_2"}
+    assert set(jobs) == {
+        "uniform",
+        "quantvla",
+        "da_ptq",
+        "equal_weight",
+        "random_seed_0",
+        "random_seed_1",
+        "random_seed_2",
+    }
     assert all(job["weight_bits"] == 2 for job in jobs.values())
     assert all(job["activation_bits"] == 8 for job in jobs.values())
     assert all(job["bf16_ratio"] == 0.3 for job in jobs.values())

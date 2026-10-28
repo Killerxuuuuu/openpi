@@ -9,6 +9,18 @@ import numpy as np
 import torch
 
 
+def eligible_frames(task_ids, episode_ids, max_episodes_per_task):
+    """Limit each task to its first N demonstration episodes, deterministically."""
+    if max_episodes_per_task == 0:
+        return np.arange(len(task_ids))
+    permitted = np.zeros(len(task_ids), dtype=bool)
+    for task in np.unique(task_ids):
+        task_mask = task_ids == task
+        episodes = np.unique(episode_ids[task_mask])[:max_episodes_per_task]
+        permitted |= task_mask & np.isin(episode_ids, episodes)
+    return np.flatnonzero(permitted)
+
+
 def choose_indices(task_ids, positions, *, samples, seed, spatial_bins, warmup_samples, balanced=True):
     """Round-robin tasks and spatial bins using workspace positions, not actions."""
     rng = np.random.default_rng(seed)
@@ -55,6 +67,7 @@ class LiberoCalibrationData:
         task_balanced=True,
         spatial_bins=6,
         spatial_warmup_samples=128,
+        max_episodes_per_task=0,
     ):
         # Only this adapter needs openpi's full JAX/LeRobot environment.
         import jax
@@ -90,6 +103,10 @@ class LiberoCalibrationData:
         if not 0 < samples <= len(dataset):
             raise ValueError(f"Requested {samples} distinct calibration frames from {len(dataset)} available")
         task_ids = np.asarray(self.raw.hf_dataset["task_index"]).reshape(-1).astype(int)
+        episode_ids = np.asarray(self.raw.hf_dataset["episode_index"]).reshape(-1).astype(int)
+        eligible = eligible_frames(task_ids, episode_ids, max_episodes_per_task)
+        if len(eligible) < samples:
+            raise ValueError("Episode limit leaves too few calibration frames")
         positions = np.asarray(self.raw.hf_dataset["state"], dtype=np.float64)[:, :3]
         if positions.shape != (len(dataset), 3) or not np.isfinite(positions).all():
             raise ValueError("LIBERO state must contain finite Cartesian end-effector positions")
@@ -116,18 +133,21 @@ class LiberoCalibrationData:
                 or len(set(indices)) != samples
                 or min(indices) < 0
                 or max(indices) >= len(dataset)
+                or not np.isin(indices, eligible).all()
             ):
                 raise ValueError("Saved calibration selection has an invalid size or indices")
         else:
-            indices, warmup = choose_indices(
-                task_ids,
-                positions,
+            local_indices, local_warmup = choose_indices(
+                task_ids[eligible],
+                positions[eligible],
                 samples=samples,
                 seed=seed,
                 spatial_bins=spatial_bins,
                 warmup_samples=spatial_warmup_samples,
                 balanced=task_balanced,
             )
+            indices = eligible[local_indices].tolist()
+            warmup = eligible[local_warmup].tolist()
         self.indices = indices
         self.manifest = {
             "repo_id": data_config.repo_id,
@@ -143,6 +163,8 @@ class LiberoCalibrationData:
             "spatial_warmup_indices": warmup,
             "normalization": "original_checkpoint_assets",
             "action_horizon": train_config.model.action_horizon,
+            "max_episodes_per_task": max_episodes_per_task,
+            "episode_ids": episode_ids[indices].tolist(),
         }
 
     def __call__(self):

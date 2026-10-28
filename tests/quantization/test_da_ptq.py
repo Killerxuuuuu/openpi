@@ -85,7 +85,7 @@ def batches():
 
 
 def toy_config(mode="da_ptq"):
-    return PTQConfig(mode=mode, calibration_samples=3, probe_steps=2, csrc_rank=2, csrc_max_iter=12)
+    return PTQConfig(profile="legacy", mode=mode, calibration_samples=3, probe_steps=2, csrc_rank=2, csrc_max_iter=12)
 
 
 def test_int2_codebook_and_zero_rows():

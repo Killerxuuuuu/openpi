@@ -8,6 +8,7 @@ import argparse
 import collections
 import json
 import logging
+import os
 from pathlib import Path
 import time
 
@@ -25,8 +26,15 @@ def main():
     parser.add_argument("--wait-steps", type=int, default=10)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--save-video", action="store_true")
+    parser.add_argument("--video-max-trials", type=int, default=0, help="Videos per task/seed; 0 saves every trial")
     args = parser.parse_args()
-    if args.num_trials < 1 or args.replan_steps < 1 or args.wait_steps < 0 or len(set(args.seeds)) != len(args.seeds):
+    if (
+        args.num_trials < 1
+        or args.replan_steps < 1
+        or args.wait_steps < 0
+        or args.video_max_trials < 0
+        or len(set(args.seeds)) != len(args.seeds)
+    ):
         parser.error("Invalid trial/replan/wait counts or duplicate seeds")
 
     import imageio
@@ -49,7 +57,12 @@ def main():
     run_dir = args.output_dir / args.suite
     # Refuse accidental overwrites/mixing partial results from another policy.
     run_dir.mkdir(parents=True, exist_ok=False)
-    configuration = {**vars(args), "output_dir": str(args.output_dir), "server": metadata}
+    configuration = {
+        **vars(args),
+        "output_dir": str(args.output_dir),
+        "server": metadata,
+        "rendering": {key: os.environ.get(key) for key in ("MUJOCO_GL", "PYOPENGL_PLATFORM", "LP_NUM_THREADS")},
+    }
     (run_dir / "evaluation_config.json").write_text(json.dumps(configuration, indent=2), encoding="utf-8")
     records = []
 
@@ -82,6 +95,7 @@ def main():
             env, description = _get_libero_env(suite.get_task(task_id), LIBERO_ENV_RESOLUTION, seed)
             try:
                 for trial in range(args.num_trials):
+                    save_video = args.save_video and (args.video_max_trials == 0 or trial < args.video_max_trials)
                     prefix = f"seed_{seed}_task_{task_id:02d}_trial_{trial:03d}"
                     env.reset()
                     obs = env.set_init_state(initial_states[trial])
@@ -141,7 +155,7 @@ def main():
                             positions.append(obs["robot0_eef_pos"].copy())
                             quaternions.append(obs["robot0_eef_quat"].copy())
                             grippers.append(obs["robot0_gripper_qpos"].copy())
-                            if args.save_video:
+                            if save_video:
                                 frames.append(np.ascontiguousarray(obs["agentview_image"][::-1, ::-1]))
                             if done:
                                 break
@@ -174,7 +188,7 @@ def main():
                     records.append(record)
                     write_summary()
                     logging.info("%s %s success=%s steps=%d", args.suite, prefix, record["success"], len(actions))
-                    if args.save_video and frames:
+                    if save_video and frames:
                         imageio.mimwrite(run_dir / (prefix + ".mp4"), frames, fps=10)
                     if error:
                         # Abort instead of disguising server/config errors as

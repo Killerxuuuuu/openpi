@@ -18,7 +18,10 @@ def parser():
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--checkpoint-dir", required=True, type=Path, help="Converted pi05_libero PyTorch checkpoint")
     result.add_argument("--output-dir", required=True, type=Path)
-    result.add_argument("--mode", choices=["all", "uniform", "da_ptq", "equal_weight", "random"], default="all")
+    result.add_argument(
+        "--mode", choices=["all", "uniform", "quantvla", "da_ptq", "equal_weight", "random"], default="all"
+    )
+    result.add_argument("--profile", choices=["quantvla", "legacy"], default="quantvla")
     result.add_argument("--config-name", default="pi05_libero")
     result.add_argument(
         "--dataset-root", type=Path, help="Optional local LeRobot dataset root, containing meta/info.json"
@@ -33,7 +36,25 @@ def parser():
     result.add_argument("--spatial-bins", type=int, default=6)
     result.add_argument("--spatial-warmup-samples", type=int, default=128)
     result.add_argument("--probe-steps", type=int, default=16)
+    result.add_argument("--skip-first-expert-blocks", type=int, default=1)
     result.add_argument("--skip-last-expert-blocks", type=int, default=2)
+    result.add_argument("--fallback-activation-bits", type=int, choices=[8, 16], default=16)
+    result.add_argument("--activation-percentile", type=float, default=99.9)
+    result.add_argument("--activation-calibration-batches", type=int, default=32)
+    result.add_argument("--quantvla-calibration-steps", type=int, default=128)
+    result.add_argument("--max-calibration-episodes-per-task", type=int, default=5)
+    result.add_argument("--rotation-block-size", type=int, default=64)
+    result.add_argument("--rotation-output-block-size", type=int, default=64)
+    result.add_argument("--rotation-permute", action=argparse.BooleanOptionalAction, default=True)
+    result.add_argument("--row-rotation", choices=["restore", "off"], default="restore")
+    result.add_argument("--rotation-device", choices=["auto", "cpu", "cuda"], default="auto")
+    result.add_argument("--quantvla-smoothing", type=float, default=0.15)
+    result.add_argument("--weight-scale-mode", choices=["mse", "rtn"], default="mse")
+    result.add_argument("--atm-enabled", action=argparse.BooleanOptionalAction, default=True)
+    result.add_argument("--ohb-enabled", action=argparse.BooleanOptionalAction, default=True)
+    result.add_argument("--atm-log-clamp", type=float, default=0.30)
+    result.add_argument("--ohb-log-clamp", type=float, default=0.30)
+    result.add_argument("--matching-neutral-band", type=float, default=0.03)
     result.add_argument("--weight-bits", type=int, default=2)
     result.add_argument("--activation-bits", type=int, default=8)
     result.add_argument("--damping", type=float, default=3e-4)
@@ -68,7 +89,10 @@ def configurations(args):
     }
     overrides["csrc_enabled"] = not args.no_csrc
     jobs = []
-    for mode in ["uniform", "da_ptq", "equal_weight", "random"] if args.mode == "all" else [args.mode]:
+    modes = ["uniform", "quantvla", "da_ptq", "equal_weight", "random"]
+    if args.profile == "legacy":
+        modes.remove("quantvla")
+    for mode in modes if args.mode == "all" else [args.mode]:
         seeds = args.random_seeds if mode == "random" else [0]
         for seed in seeds:
             config = PTQConfig(**overrides, mode=mode, allocation_seed=seed)
@@ -131,6 +155,7 @@ def main(argv=None):
         task_balanced=not args.unbalanced_sampling,
         spatial_bins=args.spatial_bins,
         spatial_warmup_samples=args.spatial_warmup_samples,
+        max_episodes_per_task=args.max_calibration_episodes_per_task if args.profile == "quantvla" else 0,
     )
     selection_path = args.output_dir / "calibration_selection.json"
     if selection_path.exists():

@@ -196,6 +196,15 @@ class PaliGemmaWithExpertModel(nn.Module):
                 batch_size = query_states.shape[0]
                 scaling = self.paligemma.language_model.layers[layer_idx].self_attn.scaling
 
+                # Offline QuantVLA calibration observes actual post-RoPE
+                # suffix-query logits against both prefix and suffix keys.
+                # No callback is installed during deployment/inference.
+                observer = getattr(models[1].layers[layer_idx].self_attn, "_quantvla_logits_observer", None)
+                if observer is not None:
+                    prefix_length = inputs_embeds[0].shape[1]
+                    suffix_mask = None if attention_mask is None else attention_mask[..., prefix_length:, :]
+                    observer(query_states[..., prefix_length:, :], key_states, suffix_mask, scaling)
+
                 # Attention computation
                 att_output, _ = modeling_gemma.eager_attention_forward(
                     self.paligemma.language_model.layers[layer_idx].self_attn,

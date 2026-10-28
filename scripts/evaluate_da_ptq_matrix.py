@@ -18,8 +18,8 @@ def main():
     parser.add_argument("--bf16-checkpoint", type=Path, help="Optional original converted checkpoint")
     parser.add_argument(
         "--variants",
-        nargs="+",
-        default=["uniform", "da_ptq", "equal_weight", "random_seed_0", "random_seed_1", "random_seed_2"],
+        nargs="*",
+        default=["quantvla", "da_ptq", "equal_weight", "random_seed_0", "random_seed_1", "random_seed_2"],
     )
     parser.add_argument("--suites", nargs="+", default=["libero_spatial", "libero_object", "libero_goal", "libero_10"])
     parser.add_argument("--eval-python", default=sys.executable, help="Python executable in the LIBERO environment")
@@ -28,11 +28,15 @@ def main():
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--startup-timeout", type=float, default=600)
+    parser.add_argument("--save-video", action="store_true")
+    parser.add_argument("--video-max-trials", type=int, default=0)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[1]
     jobs = [(name, (args.runs_dir / name).resolve()) for name in args.variants]
     if args.bf16_checkpoint is not None:
         jobs.insert(0, ("bf16", args.bf16_checkpoint.resolve()))
+    if not jobs or not args.eval_python.strip():
+        parser.error("Provide at least one variant/BF16 checkpoint and a nonempty --eval-python")
     for name, checkpoint in jobs:
         if not (checkpoint / "model.safetensors").is_file():
             raise FileNotFoundError(f"Missing converted/calibrated checkpoint for {name}: {checkpoint}")
@@ -99,6 +103,11 @@ def main():
                             str(job_dir.resolve()),
                             "--seeds",
                             *map(str, args.seeds),
+                            *(
+                                ["--save-video", "--video-max-trials", str(args.video_max_trials)]
+                                if args.save_video
+                                else []
+                            ),
                         ],
                         cwd=root,
                         env=environment,

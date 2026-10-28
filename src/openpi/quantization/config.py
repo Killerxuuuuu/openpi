@@ -12,8 +12,9 @@ EXPERT = r"paligemma_with_expert\.gemma_expert\.model\.layers\.\d+"
 
 @dataclass(frozen=True)
 class PTQConfig:
-    # uniform = W2A8 only; the other modes all retain CSRC and the same BF16 budget.
-    mode: Literal["uniform", "da_ptq", "equal_weight", "random"] = "da_ptq"
+    # Legacy artifacts remain loadable; new experiments share a QuantVLA base.
+    profile: Literal["legacy", "quantvla"] = "quantvla"
+    mode: Literal["uniform", "quantvla", "da_ptq", "equal_weight", "random"] = "da_ptq"
     weight_bits: int = 2
     activation_bits: int = 8
     bf16_ratio: float = 0.30
@@ -22,7 +23,25 @@ class PTQConfig:
     spatial_bins: int = 6
     spatial_warmup_samples: int = 128
     probe_steps: int = 16
+    skip_first_expert_blocks: int = 1
     skip_last_expert_blocks: int = 2
+    fallback_activation_bits: int = 16
+    activation_percentile: float = 99.9
+    activation_calibration_batches: int = 32
+    quantvla_calibration_steps: int = 128
+    max_calibration_episodes_per_task: int = 5
+    rotation_block_size: int = 64
+    rotation_output_block_size: int = 64
+    rotation_permute: bool = True
+    row_rotation: Literal["restore", "off"] = "restore"
+    rotation_device: Literal["auto", "cpu", "cuda"] = "auto"
+    quantvla_smoothing: float = 0.15
+    weight_scale_mode: Literal["mse", "rtn"] = "mse"
+    atm_enabled: bool = True
+    ohb_enabled: bool = True
+    atm_log_clamp: float = 0.30
+    ohb_log_clamp: float = 0.30
+    matching_neutral_band: float = 0.03
     damping: float = 3e-4
     planar_weight: float = 1.8
     control_weight: float = 0.15
@@ -52,8 +71,12 @@ class PTQConfig:
     eps: float = 1e-6
 
     def __post_init__(self):
-        if self.mode not in {"uniform", "da_ptq", "equal_weight", "random"}:
+        if self.profile not in {"legacy", "quantvla"}:
+            raise ValueError(f"Unknown quantization profile: {self.profile}")
+        if self.mode not in {"uniform", "quantvla", "da_ptq", "equal_weight", "random"}:
             raise ValueError(f"Unknown mode: {self.mode}")
+        if self.mode == "quantvla" and self.profile != "quantvla":
+            raise ValueError("The quantvla baseline requires --profile quantvla")
         if not 2 <= self.weight_bits <= 8 or not 2 <= self.activation_bits <= 8:
             raise ValueError("Fake quantization supports weight/activation bits in [2, 8].")
         if not 0 <= self.bf16_ratio <= 1:
@@ -68,11 +91,27 @@ class PTQConfig:
             "csrc_max_iter",
             "csrc_max_dim",
             "max_tokens_per_call",
+            "activation_calibration_batches",
+            "quantvla_calibration_steps",
+            "rotation_block_size",
+            "rotation_output_block_size",
         ):
             if getattr(self, key) < 1:
                 raise ValueError(f"{key} must be positive")
-        if self.skip_last_expert_blocks < 0 or self.action_timestep < 0:
+        if min(self.skip_first_expert_blocks, self.skip_last_expert_blocks, self.action_timestep) < 0:
             raise ValueError("Block count and action timestep cannot be negative.")
+        if self.max_calibration_episodes_per_task < 0:
+            raise ValueError("Episode limit must be nonnegative (0 means unlimited)")
+        if self.fallback_activation_bits not in {8, 16}:
+            raise ValueError("Fallback activation precision must be 8 or 16")
+        if not 0 < self.activation_percentile <= 100:
+            raise ValueError("Activation percentile must be in (0, 100]")
+        if not 0 <= self.quantvla_smoothing <= 1:
+            raise ValueError("QuantVLA energy smoothing must be in [0, 1]")
+        if self.row_rotation not in {"restore", "off"} or self.rotation_device not in {"auto", "cpu", "cuda"}:
+            raise ValueError("Invalid rotation mode/device")
+        if self.weight_scale_mode not in {"mse", "rtn"}:
+            raise ValueError("Unknown weight scale mode")
         if self.action_dims != 7:
             raise ValueError("The paper's structural prior is defined for seven action dimensions.")
         if not 0 < self.csrc_scale_min <= self.csrc_scale_max:
@@ -86,6 +125,9 @@ class PTQConfig:
             "csrc_feature_weight",
             "csrc_identity_weight",
             "csrc_tolerance",
+            "atm_log_clamp",
+            "ohb_log_clamp",
+            "matching_neutral_band",
         ):
             value = getattr(self, key)
             if not math.isfinite(value) or value < 0:
@@ -97,7 +139,11 @@ class PTQConfig:
 
     @property
     def use_csrc(self) -> bool:
-        return self.csrc_enabled and self.mode != "uniform"
+        return self.csrc_enabled and self.mode not in {"uniform", "quantvla"}
+
+    @property
+    def use_quantvla(self) -> bool:
+        return self.profile == "quantvla" and self.mode != "uniform"
 
     def to_dict(self) -> dict:
         return asdict(self)

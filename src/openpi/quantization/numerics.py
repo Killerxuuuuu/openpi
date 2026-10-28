@@ -10,7 +10,9 @@ from openpi.quantization.config import PTQConfig
 
 
 @torch.no_grad()
-def quantize_weight(weight: torch.Tensor, bits: int) -> torch.Tensor:
+def quantize_weight(
+    weight: torch.Tensor, bits: int, *, scale_mode: str = "mse", reciprocal_grid: bool = False
+) -> torch.Tensor:
     """Signed, zero-point-zero INT codebook with per-output-channel MSE scales.
 
     Values remain floating point (QDQ), not packed integers. INT2's signed range
@@ -28,8 +30,9 @@ def quantize_weight(weight: torch.Tensor, bits: int) -> torch.Tensor:
         base = values.abs().amax(-1, keepdim=True).clamp_min(1e-8) / qmax
         best_error = torch.full_like(base, float("inf"))
         best = torch.zeros_like(values)
-        for factor in (0.5, 0.75, 1.0, 1.25, 1.5):
-            scale = base * factor
+        factors = (1.0,) if scale_mode == "rtn" else (0.5, 0.75, 1.0, 1.25, 1.5)
+        for factor in factors:
+            scale = base / factor if reciprocal_grid else base * factor
             candidate = (values / scale).round().clamp(qmin, qmax) * scale
             error = (candidate - values).square().mean(-1, keepdim=True)
             better = error < best_error
@@ -70,7 +73,7 @@ class FakeQuantLinear(nn.Linear):
         if self.observe:
             observed = inputs.detach().float().reshape(-1, self.in_features).abs().amax(0)
             self.observed_absmax.copy_(torch.maximum(self.observed_absmax, observed))
-        if self.activation_quant_enabled:
+        if self.activation_quant_enabled and self.activation_bits < 16:
             limit = 2 ** (self.activation_bits - 1) - 1
             scale = self.activation_absmax.clamp_min(1e-8) / limit
             values = inputs.float()

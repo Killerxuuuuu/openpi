@@ -10,7 +10,9 @@ from safetensors.torch import save_model
 from torch import nn
 
 from openpi.quantization.calibration import replace_module
+from openpi.quantization.config import PTQConfig
 from openpi.quantization.numerics import FakeQuantLinear
+from openpi.quantization.quantvla import QuantVLALinear
 
 MANIFEST = "da_ptq.json"
 SIDECAR = "da_ptq.safetensors"
@@ -39,6 +41,9 @@ def save_checkpoint(model, report: dict, destination: str | Path, *, assets_sour
     for name, info in report["layers"].items():
         module = model.get_submodule(name)
         state[f"{name}.activation_absmax"] = module.activation_absmax.detach().cpu().contiguous()
+        if isinstance(module, QuantVLALinear):
+            for key in module.transform_buffer_names:
+                state[f"{name}.{key}"] = getattr(module, key).detach().cpu().contiguous()
         if not info["original_bias"] and module.bias is not None:
             state[f"{name}.added_bias"] = module.bias.detach().cpu().contiguous()
     save_file(state, str(destination / SIDECAR))
@@ -60,20 +65,37 @@ def restore_quantization(model, checkpoint_dir: str | Path) -> dict:
     """
     directory = Path(checkpoint_dir)
     report = json.loads((directory / MANIFEST).read_text(encoding="utf-8"))
-    if report.get("format_version") != 1 or report.get("implementation") != "floating_QDQ_not_packed_integer":
+    if report.get("format_version") not in {1, 2} or report.get("implementation") != "floating_QDQ_not_packed_integer":
         raise ValueError("Unsupported DA-PTQ checkpoint format")
     sidecar = load_file(str(directory / SIDECAR), device="cpu")
     if hasattr(model, "config") and "model_config" in report:
         for key in ("action_dim", "action_horizon", "pi05"):
             if getattr(model.config, key) != report["model_config"][key]:
                 raise ValueError(f"Model configuration differs from calibrated checkpoint: {key}")
+    config = PTQConfig(**{"profile": "legacy", **report["config"]})
     for name, info in report["layers"].items():
         source = model.get_submodule(name)
         if not isinstance(source, nn.Linear) or isinstance(source, FakeQuantLinear):
             raise ValueError(f"Expected an unwrapped Linear at {name}")
-        replacement = FakeQuantLinear(
-            source, info["weight_bits"], info["activation_bits"], sidecar[f"{name}.activation_absmax"], quantize=False
-        )
+        if info.get("wrapper") == "quantvla":
+            replacement = QuantVLALinear(
+                source,
+                info["weight_bits"],
+                info["activation_bits"],
+                sidecar[f"{name}.activation_absmax"],
+                config,
+                initialize=False,
+            )
+            for key in replacement.transform_buffer_names:
+                getattr(replacement, key).copy_(sidecar[f"{name}.{key}"])
+        else:
+            replacement = FakeQuantLinear(
+                source,
+                info["weight_bits"],
+                info["activation_bits"],
+                sidecar[f"{name}.activation_absmax"],
+                quantize=False,
+            )
         bias_key = f"{name}.added_bias"
         if bias_key in sidecar:
             replacement.bias = nn.Parameter(

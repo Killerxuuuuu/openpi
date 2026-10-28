@@ -18,6 +18,9 @@ from openpi.quantization.numerics import fit_csrc
 from openpi.quantization.numerics import normalize_prior
 from openpi.quantization.numerics import structural_weights
 from openpi.quantization.numerics import weighted_flow_loss
+from openpi.quantization.quantvla import AttentionStatistics
+from openpi.quantization.quantvla import QuantVLALinear
+from openpi.quantization.quantvla import fold_attention_matching
 
 logger = logging.getLogger(__name__)
 BatchFactory = Callable[[], Iterable[tuple[object, torch.Tensor]]]
@@ -50,12 +53,20 @@ def select_modules(model: nn.Module, config: PTQConfig):
     protected_blocks = (
         set(expert_blocks[-config.skip_last_expert_blocks :]) if config.skip_last_expert_blocks else set()
     )
+    if config.profile == "quantvla":
+        protected_blocks.update(expert_blocks[: config.skip_first_expert_blocks])
     protected = [
         name
         for name in linears
         if (match := re.search(r"gemma_expert\.model\.layers\.(\d+)\.mlp\.", name))
         and int(match.group(1)) in protected_blocks
     ]
+    if config.profile == "quantvla":
+        protected.extend(
+            name
+            for name in linears
+            if re.fullmatch(r".*gemma_expert\.model\.layers\.\d+\.self_attn\.(?:q_proj|k_proj|v_proj|o_proj)", name)
+        )
     quant = {
         name: module
         for name, module in linears.items()
@@ -65,9 +76,9 @@ def select_modules(model: nn.Module, config: PTQConfig):
     csrc = {name: module for name, module in quant.items() if re.fullmatch(config.csrc_regex, name)}
     if not quant:
         raise ValueError("quant_regex matched no eligible Linear modules. Inspect the model module names.")
-    if config.mode != "uniform" and not rank:
+    if config.mode not in {"uniform", "quantvla"} and not rank:
         raise ValueError("rank_regex matched no eligible layers after protecting the last expert blocks.")
-    if config.mode != "uniform" and len({module.weight.numel() for module in rank.values()}) != 1:
+    if config.mode not in {"uniform", "quantvla"} and len({module.weight.numel() for module in rank.values()}) != 1:
         raise ValueError(
             "Ranking candidates must have equal weight cost for exact same-budget controls. "
             "Restrict rank_regex to equal-cost projections."
@@ -81,7 +92,7 @@ def select_modules(model: nn.Module, config: PTQConfig):
 
 def allocate_precision(candidates: dict[str, nn.Linear], scores: dict[str, float], config: PTQConfig):
     """Global top-k layers, with exact equal-cost BF16 budgets across controls."""
-    if config.mode == "uniform":
+    if config.mode in {"uniform", "quantvla"}:
         return []
     names = sorted(candidates)
     count = math.ceil(len(names) * config.bf16_ratio)
@@ -114,6 +125,7 @@ def activation_collection(model, quant, targets, config, *, collect_inputs):
     """Gather streaming covariance; omit invalid prefix tokens for CSRC."""
     moments = {name: Moments() for name in targets}
     inputs = {name: torch.zeros(module.in_features) for name, module in quant.items()} if collect_inputs else {}
+    input_counts = dict.fromkeys(quant, 0)
     current_mask = [None]
     original_embed_prefix = getattr(model, "embed_prefix", None)
     had_instance_method = "embed_prefix" in model.__dict__
@@ -129,8 +141,16 @@ def activation_collection(model, quant, targets, config, *, collect_inputs):
 
     def make_input_hook(name):
         def hook(module, args):
+            if config.profile == "quantvla" and input_counts[name] >= config.activation_calibration_batches:
+                return
             values = args[0].detach().float().reshape(-1, module.in_features)
-            inputs[name] = torch.maximum(inputs[name], values.abs().amax(0).cpu())
+            threshold = (
+                torch.quantile(values.abs(), config.activation_percentile / 100, dim=0)
+                if config.profile == "quantvla"
+                else values.abs().amax(0)
+            )
+            inputs[name] = torch.maximum(inputs[name], threshold.cpu())
+            input_counts[name] += 1
 
         return hook
 
@@ -188,7 +208,7 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
     device = next(model.parameters()).device
     timings = {}
     report = {
-        "format_version": 1,
+        "format_version": 2 if config.profile == "quantvla" else 1,
         "implementation": "floating_QDQ_not_packed_integer",
         "config": config.to_dict(),
         "protected_layers": protected,
@@ -204,6 +224,18 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
             "calibration_unit": "sampled_frame_with_action_chunk_not_whole_trajectory",
         },
     }
+    if config.profile == "quantvla":
+        report["adaptation"].update(
+            scope="QuantVLA_LLM_linears_and_expert_MLP_with_fixed_boundary_protection",
+            fixed_attention_protection="all_expert_Q_K_V_O_weights_and_activations",
+            boundary_protection_source="existing_CogACT_adapter_first1_last2_not_a_claim_from_QuantVLA_paper",
+            quantvla_reference="QuantVLA_2602.20309v3_Appendix_D_and_released_GR00T_code",
+            quantvla_port="new_pi05_adapter_not_bit_exact_official_pi05_reproduction",
+            activation_scale="signed_per_input_channel_percentile_as_released_code",
+            rotation="weight_covariance_eigh_SVD_equivalent_blocks_with_output_restore",
+            smoothing="released_code_weight_energy_mix_not_unimplemented_diagonal_Lambda",
+            matching="multiply_teacher_student_ratios_as_released_code; log_clamp_Appendix_D",
+        )
 
     def start():
         _sync(model)
@@ -231,7 +263,7 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
         if sample_count == 0:
             raise ValueError("Calibration set is empty")
         prior, effective = normalize_prior(prior_sum / sample_count, config)
-        weights = torch.ones(7) if config.mode in {"equal_weight", "uniform", "random"} else effective
+        weights = torch.ones(7) if config.mode in {"equal_weight", "uniform", "quantvla", "random"} else effective
         report.update(
             calibration_samples=sample_count,
             structural_prior=prior.tolist(),
@@ -249,8 +281,15 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
                 module.weight.requires_grad_(requires_grad=True)
         probe_count = 0
         teacher_loss = 0.0
-        with activation_collection(model, quant, csrc, config, collect_inputs=True) as (input_ranges, teacher_moments):
+        matching_enabled = config.use_quantvla and (config.atm_enabled or config.ohb_enabled)
+        attention_context = AttentionStatistics(model) if matching_enabled else contextlib.nullcontext()
+        with (
+            activation_collection(model, quant, csrc, config, collect_inputs=True) as (input_ranges, teacher_moments),
+            attention_context as attention_statistics,
+        ):
             for step, (observation, actions) in enumerate(batches()):
+                if matching_enabled:
+                    attention_statistics.active = step < config.quantvla_calibration_steps
                 probe = need_grad and step < config.probe_steps
                 with torch.set_grad_enabled(probe):
                     losses = forward_batch(model, observation, actions, config.seed + step)
@@ -270,6 +309,7 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
                 del losses, loss
                 if step % 16 == 0:
                     logger.info("Teacher profiling batch %d", step)
+            teacher_attention = attention_statistics.finalize() if matching_enabled else {}
         for module in candidates.values():
             module.weight.requires_grad_(requires_grad=False)
         if need_grad:
@@ -288,20 +328,34 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
         stamp = start()
         added_biases = []
         layer_metadata = {}
-        for name, source in quant.items():
+        # Release old module references one layer at a time. Holding quant,
+        # candidate and parameter_flags dictionaries would double GPU weights.
+        del candidates, csrc
+        parameter_flags = None
+        for name in list(quant):
+            source = quant.pop(name)
             bits = 16 if name in high_layers else config.weight_bits
+            act_bits = (
+                config.fallback_activation_bits
+                if name in high_layers and config.profile == "quantvla"
+                else config.activation_bits
+            )
             if not torch.isfinite(input_ranges[name]).all() or input_ranges[name].max() == 0:
                 raise ValueError(f"No finite nonzero input range for {name}")
-            replacement = FakeQuantLinear(source, bits, config.activation_bits, input_ranges[name])
+            replacement = (
+                QuantVLALinear(source, bits, act_bits, input_ranges[name], config)
+                if config.use_quantvla
+                else FakeQuantLinear(source, bits, act_bits, input_ranges[name])
+            )
             replace_module(model, name, replacement)
             layer_metadata[name] = {
                 "weight_bits": bits,
-                "activation_bits": config.activation_bits,
+                "activation_bits": act_bits,
                 "original_bias": source.bias is not None,
+                "wrapper": "quantvla" if config.use_quantvla else "qdq",
             }
         # Do not retain the old teacher Linear modules or their GPU parameters.
-        del quant, candidates, csrc
-        parameter_flags = None
+        del quant, source
         quantized_modules = {name: model.get_submodule(name) for name in layer_metadata}
         targets = {
             name: module
@@ -309,6 +363,31 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
             if config.use_csrc and re.fullmatch(config.csrc_regex, name)
         }
         finish("weight_quantization", stamp)
+
+        def calibrate_ranges(stage, *, bootstrap=False):
+            stamp = start()
+            for module in quantized_modules.values():
+                if isinstance(module, QuantVLALinear):
+                    module.reset_observer()
+                else:
+                    module.observe = True
+                    module.observed_absmax.zero_()
+                module.activation_quant_enabled = not bootstrap
+            with torch.no_grad():
+                for step, (observation, actions) in enumerate(batches()):
+                    if config.profile == "quantvla" and step >= config.activation_calibration_batches:
+                        break
+                    forward_batch(model, observation, actions, config.seed + step)
+            for name, module in quantized_modules.items():
+                module.observe = False
+                module.activation_quant_enabled = True
+                if not torch.isfinite(module.observed_absmax).all():
+                    raise FloatingPointError(f"Nonfinite final activation range: {name}")
+                module.activation_absmax.copy_(module.observed_absmax.clamp_min(1e-8))
+            finish(stage, stamp)
+
+        if config.use_quantvla:
+            calibrate_ranges("rotated_activation_calibration", bootstrap=True)
 
         stamp = start()
         quant_loss = 0.0
@@ -337,21 +416,35 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
         finish("csrc_fit_svd_fold_requantize", stamp)
         del teacher_moments, q_moments
 
-        stamp = start()
-        # Observe downstream ranges of the FINAL weight configuration. No CSRC
-        # branches remain, and this pass does not modify any model weights.
-        for module in quantized_modules.values():
-            module.observe = True
-            module.observed_absmax.zero_()
-        with torch.no_grad():
-            for step, (observation, actions) in enumerate(batches()):
-                forward_batch(model, observation, actions, config.seed + step)
-        for name, module in quantized_modules.items():
-            module.observe = False
-            if not torch.isfinite(module.observed_absmax).all():
-                raise FloatingPointError(f"Nonfinite final activation range: {name}")
-            module.activation_absmax.copy_(module.observed_absmax.clamp_min(1e-8))
-        finish("final_activation_calibration", stamp)
+        if matching_enabled:
+            calibrate_ranges("post_csrc_activation_calibration")
+
+            def measure_attention(stage):
+                stamp = start()
+                with AttentionStatistics(model) as statistics, torch.no_grad():
+                    for step, (observation, actions) in enumerate(batches()):
+                        if step >= config.quantvla_calibration_steps:
+                            break
+                        forward_batch(model, observation, actions, config.seed + step)
+                    result = statistics.finalize()
+                finish(stage, stamp)
+                return result
+
+            report["quantvla_matching"] = {"teacher": teacher_attention, "atm": {}, "ohb": {}}
+            student = measure_attention("quantvla_attention_statistics")
+            if config.atm_enabled:
+                report["quantvla_matching"]["atm"] = fold_attention_matching(
+                    model, teacher_attention, student, config, component="atm"
+                )
+            if config.ohb_enabled:
+                if config.atm_enabled:
+                    student = measure_attention("post_atm_output_statistics")
+                report["quantvla_matching"]["ohb"] = fold_attention_matching(
+                    model, teacher_attention, student, config, component="ohb"
+                )
+            report["quantvla_matching"]["folded_into_weights"] = True
+
+        calibrate_ranges("final_activation_calibration")
         stamp = start()
         final_loss, final_count = 0.0, 0
         with torch.no_grad():

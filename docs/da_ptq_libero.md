@@ -1,5 +1,7 @@
 # π₀.₅ / LIBERO：W2A8 伪量化与 DA-PTQ 对照实验
 
+> **2026-10-28 更新：本文保留 v1/legacy 的公式与适配说明。新默认已改为包含 QuantVLA 的 v2；层保护、旋转、ATM/OHB 参数和当前双卡命令见 [v2 运行说明](da_ptq_quantvla.md)。复现本文旧流程时，所有 `quantize_da_ptq.py` 命令均须添加 `--profile legacy`；旧结果不可与新默认混用。**
+
 本实现以本地 openpi 的 PyTorch π₀.₅ 为基础。提供四种模式：
 
 服务器上下载模型与数据的逐步命令见 [服务器下载说明](da_ptq_server_download.md)。
