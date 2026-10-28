@@ -12,6 +12,8 @@ import torch
 from torch import nn
 
 from openpi.quantization.config import PTQConfig
+from openpi.quantization.config import expert_block_index
+from openpi.quantization.config import protected_expert_tail_blocks
 from openpi.quantization.numerics import FakeQuantLinear
 from openpi.quantization.numerics import Moments
 from openpi.quantization.numerics import fit_csrc
@@ -50,16 +52,12 @@ def select_modules(model: nn.Module, config: PTQConfig):
     expert_blocks = sorted(
         {int(match.group(1)) for name in linears if (match := re.search(r"gemma_expert\.model\.layers\.(\d+)\.", name))}
     )
-    protected_blocks = (
-        set(expert_blocks[-config.skip_last_expert_blocks :]) if config.skip_last_expert_blocks else set()
-    )
-    if config.profile == "quantvla":
-        protected_blocks.update(expert_blocks[: config.skip_first_expert_blocks])
+    tail_blocks = set(protected_expert_tail_blocks(linears, config.skip_last_expert_blocks))
+    first_blocks = set(expert_blocks[: config.skip_first_expert_blocks]) if config.profile == "quantvla" else set()
     protected = [
         name
         for name in linears
-        if (match := re.search(r"gemma_expert\.model\.layers\.(\d+)\.mlp\.", name))
-        and int(match.group(1)) in protected_blocks
+        if expert_block_index(name) in tail_blocks or (expert_block_index(name) in first_blocks and ".mlp." in name)
     ]
     if config.profile == "quantvla":
         protected.extend(
@@ -67,6 +65,7 @@ def select_modules(model: nn.Module, config: PTQConfig):
             for name in linears
             if re.fullmatch(r".*gemma_expert\.model\.layers\.\d+\.self_attn\.(?:q_proj|k_proj|v_proj|o_proj)", name)
         )
+    protected = sorted(set(protected))
     quant = {
         name: module
         for name, module in linears.items()
@@ -212,6 +211,9 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
         "implementation": "floating_QDQ_not_packed_integer",
         "config": config.to_dict(),
         "protected_layers": protected,
+        "mandatory_expert_tail_blocks": protected_expert_tail_blocks(
+            dict(model.named_modules()), config.skip_last_expert_blocks
+        ),
         "original_state_keys": original_state_keys,
         "adaptation": {
             "allocation_unit": "linear_layer",
@@ -236,6 +238,9 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
             smoothing="released_code_weight_energy_mix_not_unimplemented_diagonal_Lambda",
             matching="multiply_teacher_student_ratios_as_released_code; log_clamp_Appendix_D",
         )
+    report["adaptation"]["mandatory_tail_protection"] = (
+        "at_least_last_two_full_expert_blocks; no_weight_or_activation_QDQ; source_dtype_retained"
+    )
 
     def start():
         _sync(model)

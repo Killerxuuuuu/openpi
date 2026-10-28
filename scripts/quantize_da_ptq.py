@@ -37,7 +37,12 @@ def parser():
     result.add_argument("--spatial-warmup-samples", type=int, default=128)
     result.add_argument("--probe-steps", type=int, default=16)
     result.add_argument("--skip-first-expert-blocks", type=int, default=1)
-    result.add_argument("--skip-last-expert-blocks", type=int, default=2)
+    result.add_argument(
+        "--skip-last-expert-blocks",
+        type=int,
+        default=2,
+        help="Protect full final expert blocks; at least two are always protected, including when set to 0 or 1",
+    )
     result.add_argument("--fallback-activation-bits", type=int, choices=[8, 16], default=16)
     result.add_argument("--activation-percentile", type=float, default=99.9)
     result.add_argument("--activation-calibration-batches", type=int, default=32)

@@ -12,7 +12,7 @@
 | --- | --- | --- |
 | VLM 范围 | 语言模型所有 Q/K/V/O 和 MLP 线性层 | QuantVLA 的选择性布局 |
 | action expert 范围 | 只量化 MLP；所有 Q/K/V/O 保持浮点 | QuantVLA 的关键注意力保护；W/A 均不做 QDQ |
-| 固定 MLP 保护 | expert 首 1、尾 2 个 block | 沿用本地 CogACT adapter 的额外边界保护；**不是 QuantVLA 原论文规定的 block 数**，三个比较组保持一致，可用 skip 参数调整 |
+| 固定边界保护 | expert 首 1 个 block 的 MLP；尾部至少 2 个完整 block | 边界数来自本地 adapter，**不是 QuantVLA 原论文规定的 block 数**。最后两个 block 的所有线性层均不做 W/A QDQ；尾部保护不可关闭，可用 skip 参数增加 |
 | 其他浮点模块 | vision、embedding、norm、动作/时间输入输出投影 | 保留原 checkpoint 的 dtype（包括本来就是 FP32 的模块） |
 | 混合精度回退 | 其余 expert MLP 候选层中 ceil(30% × 候选数)，默认 W16A16 | DA、等权、随机相同参数预算；30% 不等于全模型 BF16 比例 |
 | 位宽 | W2A8，signed INT codebook 的浮点 QDQ | 用户要求的更低位宽；QuantVLA 附录 D 默认 W4A8，可用 `--weight-bits 4` |
@@ -25,6 +25,10 @@
 | DA/CSRC | 512 帧、batch1、16 gradient probes、相同结构先验/CSRC 参数 | 沿用现有 A.3 配置与架构适配，见旧说明中的公式、solver 和 Ω 定义 |
 
 固定保护先应用，再在剩余等成本 MLP 候选集合中分配 30%。新默认的回退层 W16A16 会同时旁路旋转和 A8；`--fallback-activation-bits 8` 才是 W16A8。所有实验采用同一设置。
+
+2026-10-28 补充硬约束：所有 profile/mode 均至少保护 action expert 最后两个完整 Transformer block，即使 `--skip-last-expert-blocks` 设为 0/1，或自定义了选层正则，也不能将它们重新量化。它们不占额外30%分配预算。实际π₀.₅加载策略保留 attention/MLP 的BF16权重，归一化及其原FP32参数仍沿用openpi精度策略；不是强制把归一化降为BF16。此约束保护精度，ATM/OHB仍可折叠到保持BF16的Q/O投影中。
+
+新manifest记录 `mandatory_expert_tail_blocks`。加载时若发现最后两个block仍有W/A低比特分配会拒绝加载；把已QDQ的权重转成BF16不能恢复原值，需要从原checkpoint重新导出。默认v2原本已排除末尾两个MLP及所有expert注意力投影，这些合规产物可继续使用，不需仅为本硬约束重新校准。旧legacy产物若量化了末尾注意力则不符合新约束。
 
 ATM 观察 **RoPE 后的真实 suffix-query/prefix+suffix-key logits**，支持 GQA 并排除 mask 元素。按 teacher/student 标准差比值缩放 action-expert Q 的每个 head；π₀.₅ 共享 prefix KV，因此只缩放 Q，避免修改共享 K。OHB 按 teacher/student 输出 RMS 比值缩放 O 的 weight/bias。两个比值均采用公开代码的乘法方向（论文部分公式的除法方向与公开实现不一致），使用附录 D 的 clamp。先折叠 ATM，再重测并折叠 OHB，是本适配的显式顺序。
 

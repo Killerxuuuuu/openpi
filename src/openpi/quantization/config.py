@@ -10,6 +10,17 @@ TEXT = r"paligemma_with_expert\.paligemma\.(?:model\.)?language_model\.layers\.\
 EXPERT = r"paligemma_with_expert\.gemma_expert\.model\.layers\.\d+"
 
 
+def expert_block_index(name: str) -> int | None:
+    match = re.search(r"(?:^|\.)gemma_expert\.model\.layers\.(\d+)(?:\.|$)", name)
+    return int(match.group(1)) if match else None
+
+
+def protected_expert_tail_blocks(names, requested: int = 2) -> list[int]:
+    """The final two action-expert blocks are mandatory in every profile/mode."""
+    blocks = sorted({index for name in names if (index := expert_block_index(name)) is not None})
+    return blocks[-max(2, requested) :]
+
+
 @dataclass(frozen=True)
 class PTQConfig:
     # Legacy artifacts remain loadable; new experiments share a QuantVLA base.
@@ -24,7 +35,7 @@ class PTQConfig:
     spatial_warmup_samples: int = 128
     probe_steps: int = 16
     skip_first_expert_blocks: int = 1
-    skip_last_expert_blocks: int = 2
+    skip_last_expert_blocks: int = 2  # Effective protection is always at least two full blocks.
     fallback_activation_bits: int = 16
     activation_percentile: float = 99.9
     activation_calibration_batches: int = 32

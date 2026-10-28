@@ -1,6 +1,7 @@
 """Numerical and actual joint-Gemma adapter checks; no full checkpoint needed."""
 
 import importlib.util
+import json
 import math
 from pathlib import Path
 import sys
@@ -251,3 +252,54 @@ def test_episode_cap_applies_independently_per_task():
     selected = eligible_frames(tasks, episodes, 2)
     assert selected.tolist() == list(range(8)) + list(range(12, 20))
     assert eligible_frames(tasks, episodes, 0).tolist() == list(range(24))
+
+
+@pytest.mark.parametrize(
+    ("profile", "mode"),
+    [(profile, mode) for profile in ("legacy", "quantvla") for mode in ("uniform", "da_ptq", "equal_weight", "random")]
+    + [("quantvla", "quantvla")],
+)
+@pytest.mark.parametrize("requested_tail_count", [0, 1, 2])
+def test_final_two_full_expert_blocks_are_always_protected(flow_model, profile, mode, requested_tail_count):
+    model = flow_model()
+    for layer in model.paligemma_with_expert.gemma_expert.model.layers[-2:]:
+        layer.extra_projection = nn.Linear(16, 16)
+        layer.to(torch.bfloat16)
+    config = PTQConfig(
+        profile=profile,
+        mode=mode,
+        skip_last_expert_blocks=requested_tail_count,
+        quant_regex=r".*",  # A broad user override must not bypass the fixed guard.
+    )
+    quantized, candidates, csrc, protected = select_modules(model, config)
+    tail_names = [
+        name
+        for name, module in model.named_modules()
+        if isinstance(module, nn.Linear) and any(f"gemma_expert.model.layers.{index}." in name for index in (2, 3))
+    ]
+    assert len(tail_names) == 16  # Q/K/V/O, gate/up/down and custom projection per block
+    for name in tail_names:
+        assert name in protected
+        assert name not in quantized
+        assert name not in candidates
+        assert name not in csrc
+        assert model.get_submodule(name).weight.dtype == torch.bfloat16
+
+
+def test_loading_rejects_artifact_that_quantizes_mandatory_tail(flow_model, tmp_path):
+    model = flow_model().eval()
+    config = PTQConfig(profile="legacy", mode="uniform", calibration_samples=3, probe_steps=1)
+    report = calibrate(model, replay, config)
+    assert report["mandatory_expert_tail_blocks"] == [2, 3]
+    destination = tmp_path / "artifact"
+    save_checkpoint(model, report, destination)
+    manifest = destination / "da_ptq.json"
+    payload = json.loads(manifest.read_text())
+    payload["layers"]["paligemma_with_expert.gemma_expert.model.layers.3.self_attn.q_proj"] = {
+        "weight_bits": 2,
+        "activation_bits": 8,
+        "original_bias": True,
+    }
+    manifest.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="mandatory final action-expert"):
+        restore_quantization(flow_model(), destination)

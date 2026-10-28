@@ -11,6 +11,8 @@ from torch import nn
 
 from openpi.quantization.calibration import replace_module
 from openpi.quantization.config import PTQConfig
+from openpi.quantization.config import expert_block_index
+from openpi.quantization.config import protected_expert_tail_blocks
 from openpi.quantization.numerics import FakeQuantLinear
 from openpi.quantization.quantvla import QuantVLALinear
 
@@ -73,6 +75,18 @@ def restore_quantization(model, checkpoint_dir: str | Path) -> dict:
             if getattr(model.config, key) != report["model_config"][key]:
                 raise ValueError(f"Model configuration differs from calibrated checkpoint: {key}")
     config = PTQConfig(**{"profile": "legacy", **report["config"]})
+    tail_blocks = set(protected_expert_tail_blocks(dict(model.named_modules()), config.skip_last_expert_blocks))
+    invalid = [
+        name
+        for name, info in report["layers"].items()
+        if expert_block_index(name) in tail_blocks and (info["weight_bits"] < 16 or info["activation_bits"] < 16)
+    ]
+    if invalid:
+        raise ValueError(
+            "Checkpoint quantizes mandatory final action-expert blocks. "
+            "Casting QDQ weights to BF16 cannot restore original values; "
+            f"re-export from the original checkpoint. Invalid layers: {invalid}"
+        )
     for name, info in report["layers"].items():
         source = model.get_submodule(name)
         if not isinstance(source, nn.Linear) or isinstance(source, FakeQuantLinear):
