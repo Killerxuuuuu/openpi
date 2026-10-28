@@ -21,7 +21,7 @@ def parser():
     result.add_argument(
         "--mode", choices=["all", "uniform", "quantvla", "da_ptq", "equal_weight", "random"], default="all"
     )
-    result.add_argument("--profile", choices=["quantvla", "legacy"], default="quantvla")
+    result.add_argument("--profile", choices=["quantvla", "legacy", "cogact"], default="quantvla")
     result.add_argument("--config-name", default="pi05_libero")
     result.add_argument(
         "--dataset-root", type=Path, help="Optional local LeRobot dataset root, containing meta/info.json"
@@ -36,20 +36,20 @@ def parser():
     result.add_argument("--spatial-bins", type=int, default=6)
     result.add_argument("--spatial-warmup-samples", type=int, default=128)
     result.add_argument("--probe-steps", type=int, default=16)
-    result.add_argument("--skip-first-expert-blocks", type=int, default=1)
+    result.add_argument("--skip-first-expert-blocks", type=int)
     result.add_argument(
         "--skip-last-expert-blocks",
         type=int,
         default=2,
         help="Protect full final expert blocks; at least two are always protected, including when set to 0 or 1",
     )
-    result.add_argument("--fallback-activation-bits", type=int, choices=[8, 16], default=16)
+    result.add_argument("--fallback-activation-bits", type=int, choices=[8, 16])
     result.add_argument("--activation-percentile", type=float, default=99.9)
-    result.add_argument("--activation-calibration-batches", type=int, default=32)
-    result.add_argument("--quantvla-calibration-steps", type=int, default=128)
+    result.add_argument("--activation-calibration-batches", type=int)
+    result.add_argument("--quantvla-calibration-steps", type=int)
     result.add_argument("--max-calibration-episodes-per-task", type=int, default=5)
-    result.add_argument("--rotation-block-size", type=int, default=64)
-    result.add_argument("--rotation-output-block-size", type=int, default=64)
+    result.add_argument("--rotation-block-size", type=int)
+    result.add_argument("--rotation-output-block-size", type=int)
     result.add_argument("--rotation-permute", action=argparse.BooleanOptionalAction, default=True)
     result.add_argument("--row-rotation", choices=["restore", "off"], default="restore")
     result.add_argument("--rotation-device", choices=["auto", "cpu", "cuda"], default="auto")
@@ -59,13 +59,14 @@ def parser():
     result.add_argument("--ohb-enabled", action=argparse.BooleanOptionalAction, default=True)
     result.add_argument("--atm-log-clamp", type=float, default=0.30)
     result.add_argument("--ohb-log-clamp", type=float, default=0.30)
-    result.add_argument("--matching-neutral-band", type=float, default=0.03)
+    result.add_argument("--matching-neutral-band", type=float)
     result.add_argument("--weight-bits", type=int, default=2)
     result.add_argument("--activation-bits", type=int, default=8)
     result.add_argument("--damping", type=float, default=3e-4)
     result.add_argument("--planar-weight", type=float, default=1.8)
     result.add_argument("--control-weight", type=float, default=0.15)
     result.add_argument("--sensitivity-gain", type=float, default=1.6)
+    result.add_argument("--physical-link-lengths", default="0.35,0.30,0.25,0.20,0.15,0.10,0.08")
     result.add_argument("--csrc-rank", type=int, default=8)
     result.add_argument("--csrc-feature-weight", type=float, default=1.0)
     result.add_argument("--csrc-identity-weight", type=float, default=8.0)
@@ -160,7 +161,7 @@ def main(argv=None):
         task_balanced=not args.unbalanced_sampling,
         spatial_bins=args.spatial_bins,
         spatial_warmup_samples=args.spatial_warmup_samples,
-        max_episodes_per_task=args.max_calibration_episodes_per_task if args.profile == "quantvla" else 0,
+        max_episodes_per_task=args.max_calibration_episodes_per_task if args.profile != "legacy" else 0,
     )
     selection_path = args.output_dir / "calibration_selection.json"
     if selection_path.exists():

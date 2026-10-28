@@ -170,10 +170,21 @@ def replay():
 
 
 @pytest.mark.parametrize("mode", ["quantvla", "da_ptq", "equal_weight", "random"])
-def test_actual_joint_adapter_calibration_export_reload(flow_model, tmp_path, mode):
+@pytest.mark.parametrize("profile", ["quantvla", "cogact"])
+def test_actual_joint_adapter_calibration_export_reload(flow_model, tmp_path, mode, profile):
     torch.manual_seed(5)
-    model = flow_model().eval()
+
+    def build():
+        result = flow_model().eval()
+        if profile == "cogact":
+            for layer in result.paligemma_with_expert.paligemma.language_model.layers:
+                layer.self_attn.k_proj.bias = None
+                layer.self_attn.v_proj.bias = None
+        return result
+
+    model = build()
     config = PTQConfig(
+        profile=profile,
         mode=mode,
         calibration_samples=3,
         probe_steps=2,
@@ -185,27 +196,35 @@ def test_actual_joint_adapter_calibration_export_reload(flow_model, tmp_path, mo
         quantvla_calibration_steps=2,
     )
     _, candidates, _, protected = select_modules(model, config)
-    assert len(candidates) == 3
-    assert len(protected) == 25  # 4 expert Q/K/V/O plus 3 protected MLP blocks
+    assert len(candidates) == (6 if profile == "cogact" else 3)
+    assert len(protected) == (38 if profile == "cogact" else 25)
     before = {name: model.get_submodule(name).weight.detach().clone() for name in protected}
     report = calibrate(model, replay, config)
     assert report["format_version"] == 2
-    assert len(report["high_precision_layers"]) == (0 if mode == "quantvla" else 1)
+    assert len(report["high_precision_layers"]) == (0 if mode == "quantvla" else math.ceil(len(candidates) * 0.3))
     assert bool(report["csrc"]) == (mode != "quantvla")
     assert report["quantvla_matching"]["folded_into_weights"]
     for name in protected:
         # ATM/OHB intentionally folds into Q/O; other fixed guards are unchanged.
-        if not name.endswith(("q_proj", "o_proj")):
+        if not name.endswith(("q_proj", "o_proj")) and name not in report["floating_csrc_layers"]:
             torch.testing.assert_close(model.get_submodule(name).weight, before[name], rtol=0, atol=0)
     for name in report["high_precision_layers"]:
         module = model.get_submodule(name)
-        assert module.weight_bits == module.activation_bits == 16
+        assert module.weight_bits == 16
+        assert module.activation_bits == config.fallback_activation_bits
+    if profile == "cogact":
+        assert all(".self_attn." not in name for name in report["layers"])
+        if config.use_csrc:
+            assert len(report["floating_csrc_layers"]) == 8
+            for name in report["floating_csrc_layers"]:
+                assert not isinstance(model.get_submodule(name), QuantVLALinear)
+                assert model.get_submodule(name).bias is not None
     assert math.isfinite(report["final_flow_mse_probe_subset"])
     observation, actions = next(replay())
     noise, time = torch.randn_like(actions), torch.tensor([0.5])
     expected = model(observation, actions, noise=noise, time=time)
     save_checkpoint(model, report, tmp_path / "artifact")
-    restored = flow_model().eval()
+    restored = build()
     load_model(restored, str(tmp_path / "artifact/model.safetensors"))
     restore_quantization(restored, tmp_path / "artifact")
     torch.testing.assert_close(restored(observation, actions, noise=noise, time=time), expected, rtol=0, atol=0)

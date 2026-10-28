@@ -205,13 +205,16 @@ def run_split_evaluation(args, jobs, workers, root, invocation, quantized, check
 
 def validate_artifact(directory, config, checkpoint, dataset, selection):
     """A manifest written last marks a complete, reusable calibration."""
+    from openpi.quantization.config import PTQConfig
+
     required = ["da_ptq.json", "model.safetensors", "da_ptq.safetensors", "assets"]
     if not all((directory / name).exists() for name in required):
         raise ValueError(
             f"Incomplete calibration at {directory}; choose a new --output-dir or move the partial variant"
         )
     report = json.loads((directory / "da_ptq.json").read_text(encoding="utf-8"))
-    if report["config"] != config.to_dict() or Path(report["source_checkpoint"]).resolve() != checkpoint:
+    saved_config = PTQConfig(**{"profile": "legacy", **report["config"]}).to_dict()
+    if saved_config != config.to_dict() or Path(report["source_checkpoint"]).resolve() != checkpoint:
         raise ValueError(f"Configuration/source changed at {directory}; choose a new --output-dir")
     if report["calibration_data"] != selection:
         raise ValueError(f"Calibration frames changed at {directory}")
@@ -330,7 +333,7 @@ def main(argv=None):
             task_balanced=not args.unbalanced_sampling,
             spatial_bins=args.spatial_bins,
             spatial_warmup_samples=args.spatial_warmup_samples,
-            max_episodes_per_task=args.max_calibration_episodes_per_task if args.profile == "quantvla" else 0,
+            max_episodes_per_task=args.max_calibration_episodes_per_task if args.profile != "legacy" else 0,
         )
         if selection is not None and selection != data.manifest:
             raise ValueError("Calibration selection settings changed; use a new --output-dir")

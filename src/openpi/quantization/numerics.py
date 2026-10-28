@@ -108,6 +108,25 @@ def structural_weights(actions: torch.Tensor, config: PTQConfig) -> torch.Tensor
         actions = actions[:, config.action_timestep]
     if actions.ndim != 2 or actions.shape[-1] < 7:
         raise ValueError("Expected [B, H, D] or [B, D] with D >= 7")
+    if config.profile == "cogact":
+        # Match the local CogACT per-batch seven-segment surrogate, including
+        # its treatment of the seventh action channel as a virtual segment.
+        q = actions[..., :7].detach().float()
+        theta = q.cumsum(-1)
+        links = q.new_tensor([float(value) for value in config.physical_link_lengths.split(",")])
+        jacobian = torch.stack(
+            [
+                -(theta.sin() * links).flip(-1).cumsum(-1).flip(-1),
+                (theta.cos() * links).flip(-1).cumsum(-1).flip(-1),
+                torch.ones_like(q),
+            ],
+            dim=1,
+        )
+        eye = torch.eye(3, device=q.device).expand(len(q), -1, -1)
+        pinv = jacobian.transpose(1, 2) @ torch.linalg.inv(jacobian @ jacobian.transpose(1, 2) + config.damping * eye)
+        axes = q.new_tensor([config.planar_weight, config.planar_weight, config.control_weight])
+        scores = (pinv.abs() * axes).mean(-1).mean(0).clamp_min(1e-8)
+        return scores / scores.mean().clamp_min(1e-8)
     q = actions[..., :7].detach().double()
     theta = q.cumsum(-1)[..., :6]
     j = torch.zeros(q.shape[0], 3, 7, device=q.device, dtype=q.dtype)
@@ -126,7 +145,7 @@ def normalize_prior(scores: torch.Tensor, config: PTQConfig) -> tuple[torch.Tens
     prior = scores.float() / scores.float().mean().clamp_min(config.eps)
     effective = (1 + config.sensitivity_gain * (prior - 1)).clamp(0.05, 20.0)
     # Common mean keeps weighted/equal gradient scales comparable.
-    return prior, effective / effective.mean()
+    return prior, effective if config.profile == "cogact" else effective / effective.mean()
 
 
 def weighted_flow_loss(losses: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:

@@ -48,6 +48,10 @@ def save_checkpoint(model, report: dict, destination: str | Path, *, assets_sour
                 state[f"{name}.{key}"] = getattr(module, key).detach().cpu().contiguous()
         if not info["original_bias"] and module.bias is not None:
             state[f"{name}.added_bias"] = module.bias.detach().cpu().contiguous()
+    for name, info in report.get("floating_csrc_layers", {}).items():
+        module = model.get_submodule(name)
+        if not info["original_bias"] and module.bias is not None:
+            state[f"{name}.added_bias"] = module.bias.detach().cpu().contiguous()
     save_file(state, str(destination / SIDECAR))
     if assets_source is not None:
         source = Path(assets_source)
@@ -116,4 +120,13 @@ def restore_quantization(model, checkpoint_dir: str | Path) -> dict:
                 sidecar[bias_key].to(source.weight.device, source.weight.dtype), requires_grad=False
             )
         replace_module(model, name, replacement)
+    for name in report.get("floating_csrc_layers", {}):
+        source = model.get_submodule(name)
+        if isinstance(source, FakeQuantLinear) or expert_block_index(name) in tail_blocks:
+            raise ValueError(f"Invalid floating compensation target: {name}")
+        bias_key = f"{name}.added_bias"
+        if bias_key in sidecar:
+            source.bias = nn.Parameter(
+                sidecar[bias_key].to(source.weight.device, source.weight.dtype), requires_grad=False
+            )
     return report

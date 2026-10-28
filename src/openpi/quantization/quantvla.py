@@ -76,6 +76,7 @@ class QuantVLALinear(FakeQuantLinear):
         self.row_rotation = config.row_rotation == "restore" and self.transform_enabled
         self.activation_percentile = config.activation_percentile
         self.activation_observation_limit = config.activation_calibration_batches
+        self.observation_row_limit = 4096 if config.profile == "cogact" else None
         self.observation_batches = 0
         self.register_buffer("input_permutation", torch.arange(self.in_features, device=self.weight.device))
         self.register_buffer(
@@ -135,6 +136,8 @@ class QuantVLALinear(FakeQuantLinear):
             )
         if self.observe and self.observation_batches < self.activation_observation_limit:
             values = inputs.detach().float().reshape(-1, self.in_features).abs()
+            if self.observation_row_limit is not None:
+                values = values[: self.observation_row_limit]
             threshold = torch.quantile(values, self.activation_percentile / 100, dim=0)
             self.observed_absmax.copy_(torch.maximum(self.observed_absmax, threshold))
             self.observation_batches += 1
@@ -263,13 +266,19 @@ def fold_attention_matching(model, teacher, student, config: PTQConfig, *, compo
             raise ValueError(f"Missing student attention statistics: {name}")
         module = model.get_submodule(name)
         if component == "atm":
-            gain = matching_gain(
-                reference["logit_std"],
-                student[name]["logit_std"],
-                config.atm_log_clamp,
-                config.matching_neutral_band,
-                config.eps,
-            )
+            if config.profile == "cogact":
+                teacher_std = torch.as_tensor(reference["logit_std"], dtype=torch.float32)
+                student_std = torch.as_tensor(student[name]["logit_std"], dtype=torch.float32)
+                gain = (teacher_std / (student_std + config.eps)).clamp(0.5, 2.0)
+                gain = torch.where((gain - 1).abs() < config.matching_neutral_band, torch.ones_like(gain), gain)
+            else:
+                gain = matching_gain(
+                    reference["logit_std"],
+                    student[name]["logit_std"],
+                    config.atm_log_clamp,
+                    config.matching_neutral_band,
+                    config.eps,
+                )
             # Scale Q alone, not K: pi0.5 has shared prefix K/V and GQA. This
             # corrects every suffix-query head against prefix AND suffix keys.
             rows = gain.repeat_interleave(module.head_dim).to(module.q_proj.weight.device)

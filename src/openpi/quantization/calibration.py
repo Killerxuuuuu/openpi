@@ -53,17 +53,23 @@ def select_modules(model: nn.Module, config: PTQConfig):
         {int(match.group(1)) for name in linears if (match := re.search(r"gemma_expert\.model\.layers\.(\d+)\.", name))}
     )
     tail_blocks = set(protected_expert_tail_blocks(linears, config.skip_last_expert_blocks))
-    first_blocks = set(expert_blocks[: config.skip_first_expert_blocks]) if config.profile == "quantvla" else set()
+    first_blocks = set(expert_blocks[: config.skip_first_expert_blocks]) if config.profile != "legacy" else set()
     protected = [
         name
         for name in linears
         if expert_block_index(name) in tail_blocks or (expert_block_index(name) in first_blocks and ".mlp." in name)
     ]
-    if config.profile == "quantvla":
+    if config.profile != "legacy":
         protected.extend(
             name
             for name in linears
             if re.fullmatch(r".*gemma_expert\.model\.layers\.\d+\.self_attn\.(?:q_proj|k_proj|v_proj|o_proj)", name)
+        )
+    if config.profile == "cogact":
+        protected.extend(
+            name
+            for name in linears
+            if ".language_model.layers." in name and re.search(r"\.self_attn\.(?:q_proj|k_proj|v_proj|o_proj)$", name)
         )
     protected = sorted(set(protected))
     quant = {
@@ -72,7 +78,12 @@ def select_modules(model: nn.Module, config: PTQConfig):
         if re.fullmatch(config.quant_regex, name) and name not in protected
     }
     rank = {name: module for name, module in quant.items() if re.fullmatch(config.rank_regex, name)}
-    csrc = {name: module for name, module in quant.items() if re.fullmatch(config.csrc_regex, name)}
+    csrc_pool = linears if config.profile == "cogact" else quant
+    csrc = {
+        name: module
+        for name, module in csrc_pool.items()
+        if re.fullmatch(config.csrc_regex, name) and expert_block_index(name) not in tail_blocks
+    }
     if not quant:
         raise ValueError("quant_regex matched no eligible Linear modules. Inspect the model module names.")
     if config.mode not in {"uniform", "quantvla"} and not rank:
@@ -140,12 +151,14 @@ def activation_collection(model, quant, targets, config, *, collect_inputs):
 
     def make_input_hook(name):
         def hook(module, args):
-            if config.profile == "quantvla" and input_counts[name] >= config.activation_calibration_batches:
+            if config.profile != "legacy" and input_counts[name] >= config.activation_calibration_batches:
                 return
             values = args[0].detach().float().reshape(-1, module.in_features)
+            if config.profile == "cogact":
+                values = values[:4096]
             threshold = (
                 torch.quantile(values.abs(), config.activation_percentile / 100, dim=0)
-                if config.profile == "quantvla"
+                if config.profile != "legacy"
                 else values.abs().amax(0)
             )
             inputs[name] = torch.maximum(inputs[name], threshold.cpu())
@@ -169,8 +182,8 @@ def activation_collection(model, quant, targets, config, *, collect_inputs):
         return hook
 
     try:
-        for name, module in quant.items():
-            if collect_inputs:
+        for name, module in {**quant, **targets}.items():
+            if collect_inputs and name in quant:
                 handles.append(module.register_forward_pre_hook(make_input_hook(name)))
             if name in targets:
                 handles.append(module.register_forward_hook(make_output_hook(name)))
@@ -207,7 +220,7 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
     device = next(model.parameters()).device
     timings = {}
     report = {
-        "format_version": 2 if config.profile == "quantvla" else 1,
+        "format_version": 2 if config.profile != "legacy" else 1,
         "implementation": "floating_QDQ_not_packed_integer",
         "config": config.to_dict(),
         "protected_layers": protected,
@@ -226,7 +239,7 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
             "calibration_unit": "sampled_frame_with_action_chunk_not_whole_trajectory",
         },
     }
-    if config.profile == "quantvla":
+    if config.profile != "legacy":
         report["adaptation"].update(
             scope="QuantVLA_LLM_linears_and_expert_MLP_with_fixed_boundary_protection",
             fixed_attention_protection="all_expert_Q_K_V_O_weights_and_activations",
@@ -237,6 +250,16 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
             rotation="weight_covariance_eigh_SVD_equivalent_blocks_with_output_restore",
             smoothing="released_code_weight_energy_mix_not_unimplemented_diagonal_Lambda",
             matching="multiply_teacher_student_ratios_as_released_code; log_clamp_Appendix_D",
+        )
+    if config.profile == "cogact":
+        report["adaptation"].update(
+            reference="local_CogACT_code_and_README; partial_alignment_not_exact_reproduction",
+            fixed_attention_protection="all_language_and_expert_Q_K_V_O",
+            retained_differences="whole_layer_FP_teacher_ranking; paper_covariance_CSRC; pi05_flow_and_KV_interface; OHB_teacher_match_direction",
+            physical_prior="local_CogACT_seven_link_per_batch_surrogate_not_physical_robot_kinematics",
+            matching="ATM_linear_clip_0.5_2.0; OHB_log_clip_multiply_not_local_inverse_beta",
+            csrc_interface="floating_prefix_KV; compensate_changed_MLP_inputs_without_quantizing_attention",
+            boundary_protection_source="local_README_first0_last2_plus_mandatory_full_tail_guard",
         )
     report["adaptation"]["mandatory_tail_protection"] = (
         "at_least_last_two_full_expert_blocks; no_weight_or_activation_QDQ; source_dtype_retained"
@@ -274,6 +297,9 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
             structural_prior=prior.tolist(),
             gain_adjusted_prior=effective.tolist(),
             loss_weights=weights.tolist(),
+            loss_weight_scope="per_batch"
+            if config.profile == "cogact" and config.mode == "da_ptq"
+            else "dataset_fixed",
         )
         finish("structural_prior", stamp)
 
@@ -298,7 +324,10 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
                 probe = need_grad and step < config.probe_steps
                 with torch.set_grad_enabled(probe):
                     losses = forward_batch(model, observation, actions, config.seed + step)
-                    loss = weighted_flow_loss(losses, weights)
+                    batch_weights = weights
+                    if config.profile == "cogact" and config.mode == "da_ptq":
+                        _, batch_weights = normalize_prior(structural_weights(actions, config), config)
+                    loss = weighted_flow_loss(losses, batch_weights)
                 if not torch.isfinite(loss):
                     raise FloatingPointError(f"Nonfinite teacher flow loss at batch {step}")
                 if probe:
@@ -335,6 +364,10 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
         layer_metadata = {}
         # Release old module references one layer at a time. Holding quant,
         # candidate and parameter_flags dictionaries would double GPU weights.
+        floating_targets = {name: module for name, module in csrc.items() if name not in quant}
+        floating_metadata = {
+            name: {"original_bias": module.bias is not None} for name, module in floating_targets.items()
+        }
         del candidates, csrc
         parameter_flags = None
         for name in list(quant):
@@ -342,7 +375,7 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
             bits = 16 if name in high_layers else config.weight_bits
             act_bits = (
                 config.fallback_activation_bits
-                if name in high_layers and config.profile == "quantvla"
+                if name in high_layers and config.profile != "legacy"
                 else config.activation_bits
             )
             if not torch.isfinite(input_ranges[name]).all() or input_ranges[name].max() == 0:
@@ -367,6 +400,8 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
             for name, module in quantized_modules.items()
             if config.use_csrc and re.fullmatch(config.csrc_regex, name)
         }
+        targets.update(floating_targets)
+        report["floating_csrc_layers"] = floating_metadata
         finish("weight_quantization", stamp)
 
         def calibrate_ranges(stage, *, bootstrap=False):
@@ -380,7 +415,7 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
                 module.activation_quant_enabled = not bootstrap
             with torch.no_grad():
                 for step, (observation, actions) in enumerate(batches()):
-                    if config.profile == "quantvla" and step >= config.activation_calibration_batches:
+                    if config.profile != "legacy" and step >= config.activation_calibration_batches:
                         break
                     forward_batch(model, observation, actions, config.seed + step)
             for name, module in quantized_modules.items():
@@ -412,10 +447,22 @@ def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dic
             logger.info("Fitting and folding CSRC: %s", name)
             correction, shift, diagnostics = fit_csrc(teacher_moments[name], q_moments[name], config)
             had_bias = module.bias is not None
-            module.fold_affine(correction, shift)
+            if isinstance(module, FakeQuantLinear):
+                module.fold_affine(correction, shift)
+            else:
+                with torch.no_grad():
+                    correction = correction.to(module.weight.device, torch.float32)
+                    shift = shift.to(module.weight.device, torch.float32)
+                    bias = shift if module.bias is None else correction @ module.bias.float() + shift
+                    module.weight.copy_((correction @ module.weight.float()).to(module.weight.dtype))
+                    if module.bias is None:
+                        module.bias = nn.Parameter(bias.to(module.weight.dtype), requires_grad=False)
+                    else:
+                        module.bias.copy_(bias.to(module.bias.dtype))
             if not had_bias:
                 added_biases.append(name)
-            diagnostics["requantized_weight_bits"] = module.weight_bits
+            diagnostics["requantized_weight_bits"] = module.weight_bits if isinstance(module, FakeQuantLinear) else None
+            diagnostics["floating_projection"] = not isinstance(module, FakeQuantLinear)
             report["csrc"][name] = diagnostics
         report["added_fused_bias_layers"] = added_biases
         finish("csrc_fit_svd_fold_requantize", stamp)

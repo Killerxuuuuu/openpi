@@ -32,10 +32,13 @@ def arguments(runner, tmp_path, *extra):
     )
 
 
-def test_worker_commands_preserve_nondefault_quantvla_parameters(runner, tmp_path):
+@pytest.mark.parametrize("profile", ["quantvla", "cogact"])
+def test_worker_commands_preserve_nondefault_quantvla_parameters(runner, tmp_path, profile):
     args = arguments(
         runner,
         tmp_path,
+        "--profile",
+        profile,
         "--activation-percentile",
         "99.5",
         "--quantvla-calibration-steps",
@@ -71,6 +74,11 @@ def test_calibration_cache_rejects_changed_budget_or_selection(runner, tmp_path)
         "source_checkpoint": str(args.checkpoint_dir.resolve()),
         "calibration_data": selection,
     }
+    (directory / "da_ptq.json").write_text(json.dumps(report))
+    runner.validate_artifact(directory, config, args.checkpoint_dir.resolve(), args.dataset_root.resolve(), selection)
+    # Older manifests omit newly introduced optional parameters; defaults must
+    # be resolved before cache comparison, without silently changing profiles.
+    del report["config"]["physical_link_lengths"]
     (directory / "da_ptq.json").write_text(json.dumps(report))
     runner.validate_artifact(directory, config, args.checkpoint_dir.resolve(), args.dataset_root.resolve(), selection)
     with pytest.raises(ValueError, match="Configuration/source"):
