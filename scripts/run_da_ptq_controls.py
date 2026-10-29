@@ -213,6 +213,18 @@ def validate_artifact(directory, config, checkpoint, dataset, selection):
             f"Incomplete calibration at {directory}; choose a new --output-dir or move the partial variant"
         )
     report = json.loads((directory / "da_ptq.json").read_text(encoding="utf-8"))
+    if config.profile == "cogact":
+        from openpi.quantization.cogact import RECIPE
+        from openpi.quantization.cogact_primitives import SOURCE_SHA256
+        from openpi.quantization.cogact_sampling import SOURCE_SHA256 as SAMPLING_SHA256
+
+        if (
+            report.get("format_version") != 3
+            or report.get("recipe") != RECIPE
+            or report.get("reference_source_sha256") != SOURCE_SHA256
+            or report.get("reference_sampling_sha256") != SAMPLING_SHA256
+        ):
+            raise ValueError(f"Old/incompatible CogACT calibration at {directory}; recalibrate in a new --output-dir")
     saved_config = PTQConfig(**{"profile": "legacy", **report["config"]}).to_dict()
     if saved_config != config.to_dict() or Path(report["source_checkpoint"]).resolve() != checkpoint:
         raise ValueError(f"Configuration/source changed at {directory}; choose a new --output-dir")
@@ -264,6 +276,10 @@ def calibration_command(args, name, config, root, selection):
 def main(argv=None):
     args = parser().parse_args(argv)
     jobs = plans(args)
+    if jobs:
+        settings = next(iter(jobs.values()))
+        args.seed = settings.seed
+        args.max_calibration_episodes_per_task = settings.max_calibration_episodes_per_task
     workers = worker_layout(args, jobs)
     if args.dry_run:
         print(
@@ -334,6 +350,8 @@ def main(argv=None):
             spatial_bins=args.spatial_bins,
             spatial_warmup_samples=args.spatial_warmup_samples,
             max_episodes_per_task=args.max_calibration_episodes_per_task if args.profile != "legacy" else 0,
+            sampling_recipe="cogact" if args.profile == "cogact" else "workspace_xyz",
+            action_timestep=settings.action_timestep,
         )
         if selection is not None and selection != data.manifest:
             raise ValueError("Calibration selection settings changed; use a new --output-dir")

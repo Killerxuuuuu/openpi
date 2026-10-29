@@ -53,6 +53,38 @@ def choose_indices(task_ids, positions, *, samples, seed, spatial_bins, warmup_s
     raise ValueError("Not enough distinct calibration frames")
 
 
+def choose_cogact_indices(actions, eligible, *, samples, batch_size, seed, spatial_bins, warmup_samples, balanced=True):
+    """Run the unchanged reference batch-XY quota selection on a seeded stream.
+
+    This uses action metadata only; it does not decode videos for discarded
+    frames. The source Bridge/RLDS stream is replaced by a LeRobot permutation.
+    """
+    from openpi.quantization.cogact_sampling import _collect_spatial_balanced_calibration_batches
+
+    order = np.random.default_rng(seed).permutation(eligible)
+    if not balanced:
+        return order[:samples].tolist(), [], {"strategy": "seeded_unbalanced_action_stream"}
+
+    def stream():
+        for start in range(0, len(order), batch_size):
+            indices = order[start : start + batch_size]
+            yield {"actions": torch.as_tensor(actions[indices]), "frame_indices": indices.tolist()}
+
+    selected, statistics = _collect_spatial_balanced_calibration_batches(
+        stream(),
+        calibrate_steps=int(np.ceil(samples / batch_size)),
+        bins=spatial_bins,
+        warmup_steps=warmup_samples,
+        action_timestep=0,
+        calib_bar=None,
+    )
+    indices = [index for batch in selected for index in batch["frame_indices"]][:samples]
+    if len(indices) != samples or len(set(indices)) != samples:
+        raise ValueError("Not enough distinct frames selected by the CogACT sampler")
+    warmup = order[: min(warmup_samples * batch_size, len(order))].tolist()
+    return indices, warmup, statistics
+
+
 class LiberoCalibrationData:
     def __init__(
         self,
@@ -68,6 +100,8 @@ class LiberoCalibrationData:
         spatial_bins=6,
         spatial_warmup_samples=128,
         max_episodes_per_task=0,
+        sampling_recipe="workspace_xyz",
+        action_timestep=0,
     ):
         # Only this adapter needs openpi's full JAX/LeRobot environment.
         import jax
@@ -110,6 +144,36 @@ class LiberoCalibrationData:
         positions = np.asarray(self.raw.hf_dataset["state"], dtype=np.float64)[:, :3]
         if positions.shape != (len(dataset), 3) or not np.isfinite(positions).all():
             raise ValueError("LIBERO state must contain finite Cartesian end-effector positions")
+        action_values = None
+        if sampling_recipe == "cogact":
+            # The official pi05_libero config passes actions through unchanged
+            # before Normalize. Reject custom delta transforms instead of
+            # silently sampling different coordinates from the model's input.
+            if getattr(train_config.data, "extra_delta_transform", False):
+                raise ValueError("CogACT action-XY sampling requires the standard LIBERO action transform")
+            raw_actions = np.asarray(self.raw.hf_dataset["actions"], dtype=np.float32)
+            if action_timestep:
+                end = np.arange(len(raw_actions))
+                for _ in range(action_timestep):
+                    next_frame = np.minimum(end + 1, len(end) - 1)
+                    end = np.where(episode_ids[next_frame] == episode_ids[end], next_frame, end)
+                raw_actions = raw_actions[end]
+            action_values = transforms.Normalize(
+                {"actions": norm_stats["actions"]},
+                use_quantiles=data_config.use_quantile_norm,
+            )({"actions": raw_actions})["actions"]
+            if not np.isfinite(action_values).all():
+                raise ValueError("Nonfinite normalized actions in calibration metadata")
+        elif sampling_recipe != "workspace_xyz":
+            raise ValueError(f"Unknown sampling recipe: {sampling_recipe}")
+        fingerprint_extra = (
+            {
+                "sampling_recipe": "cogact_action_xy_v3",
+                "actions_sha256": hashlib.sha256(action_values.tobytes()).hexdigest(),
+            }
+            if sampling_recipe == "cogact"
+            else {}
+        )
         fingerprint = hashlib.sha256(
             json.dumps(
                 {
@@ -118,6 +182,7 @@ class LiberoCalibrationData:
                     "tasks": task_ids.tolist(),
                     "hf_fingerprint": getattr(self.raw.hf_dataset, "_fingerprint", None),
                     "position_sha256": hashlib.sha256(positions.tobytes()).hexdigest(),
+                    **fingerprint_extra,
                 },
                 separators=(",", ":"),
             ).encode()
@@ -136,6 +201,17 @@ class LiberoCalibrationData:
                 or not np.isin(indices, eligible).all()
             ):
                 raise ValueError("Saved calibration selection has an invalid size or indices")
+        elif sampling_recipe == "cogact":
+            indices, warmup, _ = choose_cogact_indices(
+                action_values,
+                eligible,
+                samples=samples,
+                batch_size=batch_size,
+                seed=seed,
+                spatial_bins=spatial_bins,
+                warmup_samples=spatial_warmup_samples,
+                balanced=task_balanced,
+            )
         else:
             local_indices, local_warmup = choose_indices(
                 task_ids[eligible],
@@ -166,6 +242,14 @@ class LiberoCalibrationData:
             "max_episodes_per_task": max_episodes_per_task,
             "episode_ids": episode_ids[indices].tolist(),
         }
+        if sampling_recipe == "cogact":
+            self.manifest.update(
+                sampling_recipe="cogact_action_xy_v3",
+                task_balanced=False,
+                spatial_balanced=task_balanced,
+                coordinate_source="mean_normalized_action_XY_per_batch",
+                action_timestep=action_timestep,
+            )
 
     def __call__(self):
         # No random augmentation is applied here or in calibration forward.

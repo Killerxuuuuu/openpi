@@ -1,6 +1,6 @@
 # π₀.₅：QuantVLA 基础上的伪量化对照（2026-10-28，v2）
 
-> 2026-10-29：已核对本地 CogACT 代码，发现其实际跳过了语言侧 Q/K/V/O。新增的 `--profile cogact` 用于单独对齐该布局和部分数值设置；差异清单、保留的架构/算法差异及新校准命令见 [CogACT 对照审计](da_ptq_cogact_alignment.md)。本文的 `quantvla` 配置仍是旧协议，不会自动切换，旧校准模型也不会自动变成新配置。
+> 2026-10-29：`--profile cogact` 已更新为 `cogact_reference_v3`，直接复用本地 CogACT 数值函数，改为通道回退、W-QDQ 学生探测、原版 CSRC 和 inverse-beta OHB；需要新目录重新校准。架构适配、预算含义与 GPU 3 运行命令见 [CogACT 对照审计](da_ptq_cogact_alignment.md)。本文的 `quantvla` 仍是旧协议，不会自动切换。
 
 本次更新补齐旧 π₀.₅ 实现没有包含的 QuantVLA 基础。默认 `--profile quantvla`；旧 artifact 仍可加载，旧算法可显式用 `--profile legacy`。**旧校准结果不能作为新配置的对照，原始 BF16 checkpoint 和数据无需重新下载。**
 

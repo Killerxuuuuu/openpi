@@ -183,7 +183,7 @@ class AttentionStatistics:
     Hooks and callbacks exist only during offline calibration.
     """
 
-    def __init__(self, model):
+    def __init__(self, model, *, aggregation="pooled"):
         self.modules = {
             name: module
             for name, module in model.named_modules()
@@ -193,6 +193,9 @@ class AttentionStatistics:
         self.outputs = {}
         self.handles = []
         self.active = True
+        self.aggregation = aggregation
+        self.calls = {}
+        self.output_calls = {}
 
     def __enter__(self):
         if not self.modules:
@@ -215,11 +218,36 @@ class AttentionStatistics:
             if query.shape[1] % key.shape[1]:
                 raise ValueError("Invalid grouped-query attention geometry")
             key = key.repeat_interleave(query.shape[1] // key.shape[1], dim=1)
-            logits = query.float() @ key.float().transpose(-1, -2) * scaling
+            logits = (
+                (query.float() * float(scaling)) @ key.float().transpose(-1, -2)
+                if self.aggregation == "cogact"
+                else query.float() @ key.float().transpose(-1, -2) * scaling
+            )
             valid = torch.ones_like(logits, dtype=torch.bool)
             if attention_mask is not None:
                 mask = attention_mask[..., : key.shape[-2]]
                 valid &= mask if mask.dtype == torch.bool else mask >= 0
+            if self.aggregation == "cogact":
+                # CogACT averages the per-forward population standard deviation,
+                # rather than pooling moments across different forwards.
+                values = (
+                    torch.stack(
+                        [
+                            torch.stack(
+                                [
+                                    logits[batch, head][valid[batch, head]].std(unbiased=False)
+                                    for batch in range(logits.shape[0])
+                                ]
+                            ).mean()
+                            for head in range(logits.shape[1])
+                        ]
+                    )
+                    .float()
+                    .cpu()
+                )
+                self.logits[name] = self.logits.get(name, torch.zeros_like(values)) + values
+                self.calls[name] = self.calls.get(name, 0) + 1
+                return
             values = torch.where(valid, logits, 0).double()
             packed = torch.stack([values.sum((0, 2, 3)), values.square().sum((0, 2, 3)), valid.sum((0, 2, 3))]).cpu()
             self.logits[name] = self.logits.get(name, torch.zeros_like(packed)) + packed
@@ -230,6 +258,11 @@ class AttentionStatistics:
         @torch.no_grad()
         def capture(module, args, output):
             if self.active:
+                if self.aggregation == "cogact":
+                    rms = output.detach().float().square().mean().sqrt().cpu()
+                    self.outputs[name] = self.outputs.get(name, torch.zeros_like(rms)) + rms
+                    self.output_calls[name] = self.output_calls.get(name, 0) + 1
+                    return
                 packed = torch.tensor(
                     [output.detach().double().square().sum().item(), output.numel()], dtype=torch.float64
                 )
@@ -242,6 +275,13 @@ class AttentionStatistics:
         if missing:
             raise RuntimeError(f"No joint-attention logits captured; update gemma_pytorch.py: {sorted(missing)}")
         result = {}
+        if self.aggregation == "cogact":
+            for name, total in self.logits.items():
+                result[name] = {
+                    "logit_std": (total / self.calls[name]).tolist(),
+                    "output_rms": float(self.outputs[name] / self.output_calls[name]),
+                }
+            return result
         for name, (total, squares, count) in self.logits.items():
             if (count == 0).any():
                 raise ValueError(f"No valid attention entries: {name}")
@@ -260,6 +300,20 @@ class AttentionStatistics:
 
 @torch.no_grad()
 def fold_attention_matching(model, teacher, student, config: PTQConfig, *, component):
+    if config.profile == "cogact":
+        from openpi.quantization import cogact_primitives as reference
+        from openpi.quantization.cogact import fold_matching
+        from openpi.quantization.cogact import reference_config
+
+        if component not in {"atm", "ohb"}:
+            raise ValueError(component)
+        field, source_key = ("logit_std", "attn_logit_std") if component == "atm" else ("output_rms", "ohb_rms")
+        teacher_payload = {source_key: {name: values[field] for name, values in teacher.items()}}
+        student_payload = {source_key: {name: values[field] for name, values in student.items()}}
+        apply = reference.apply_atm_calibration if component == "atm" else reference.apply_ohb_calibration
+        gains = apply(None, teacher_payload, student_payload, reference_config(config))
+        fold_matching(model, gains if component == "atm" else {}, gains if component == "ohb" else {})
+        return gains
     result = {}
     for name, reference in teacher.items():
         if name not in student:

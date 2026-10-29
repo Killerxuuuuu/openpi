@@ -171,7 +171,8 @@ def replay():
 
 @pytest.mark.parametrize("mode", ["quantvla", "da_ptq", "equal_weight", "random"])
 @pytest.mark.parametrize("profile", ["quantvla", "cogact"])
-def test_actual_joint_adapter_calibration_export_reload(flow_model, tmp_path, mode, profile):
+@pytest.mark.parametrize("csrc_method", ["affine", "dense"])
+def test_actual_joint_adapter_calibration_export_reload(flow_model, tmp_path, mode, profile, csrc_method):
     torch.manual_seed(5)
 
     def build():
@@ -185,6 +186,7 @@ def test_actual_joint_adapter_calibration_export_reload(flow_model, tmp_path, mo
     model = build()
     config = PTQConfig(
         profile=profile,
+        csrc_method=csrc_method,
         mode=mode,
         calibration_samples=3,
         probe_steps=2,
@@ -194,23 +196,45 @@ def test_actual_joint_adapter_calibration_export_reload(flow_model, tmp_path, mo
         rotation_output_block_size=4,
         activation_calibration_batches=2,
         quantvla_calibration_steps=2,
+        rotation_cache_enabled=False,
     )
     _, candidates, _, protected = select_modules(model, config)
     assert len(candidates) == (6 if profile == "cogact" else 3)
     assert len(protected) == (38 if profile == "cogact" else 25)
     before = {name: model.get_submodule(name).weight.detach().clone() for name in protected}
     report = calibrate(model, replay, config)
-    assert report["format_version"] == 2
-    assert len(report["high_precision_layers"]) == (0 if mode == "quantvla" else math.ceil(len(candidates) * 0.3))
+    assert report["format_version"] == (3 if profile == "cogact" else 2)
+    if profile == "cogact":
+        assert report["adaptation"]["allocation_unit"] == "output_channel"
+        if mode != "quantvla":
+            total = sum(module.out_features for module in candidates.values())
+            assert sum(map(len, report["high_precision_channels"].values())) >= math.ceil(total * 0.3)
+    else:
+        assert len(report["high_precision_layers"]) == (0 if mode == "quantvla" else math.ceil(len(candidates) * 0.3))
     assert bool(report["csrc"]) == (mode != "quantvla")
     assert report["quantvla_matching"]["folded_into_weights"]
+    if profile == "cogact":
+        stages = report["stage_order"]
+        assert stages.index("teacher_statistics") < stages.index("weight_QDQ_wrapping")
+        if mode in {"da_ptq", "equal_weight"}:
+            assert stages.index("weight_QDQ_wrapping") < stages.index("weight_QDQ_student_channel_probe")
+            assert report["probe_batches"] == 2
+        assert stages.index("student_statistics_with_A8_observation") < stages.index(
+            "ATM_OHB_from_same_student_statistics"
+        )
+        assert stages.index("ATM_OHB_from_same_student_statistics") < stages.index("reference_CSRC_" + csrc_method)
+        assert stages[-1] == "final_activation_calibration"
+        assert report["quantvla_matching"]["ohb_fold_direction"] == "inverse_beta"
     for name in protected:
         # ATM/OHB intentionally folds into Q/O; other fixed guards are unchanged.
         if not name.endswith(("q_proj", "o_proj")) and name not in report["floating_csrc_layers"]:
             torch.testing.assert_close(model.get_submodule(name).weight, before[name], rtol=0, atol=0)
     for name in report["high_precision_layers"]:
         module = model.get_submodule(name)
-        assert module.weight_bits == 16
+        if profile == "cogact":
+            assert (module.adaptive_weight_bits == 16).all()
+        else:
+            assert module.weight_bits == 16
         assert module.activation_bits == config.fallback_activation_bits
     if profile == "cogact":
         assert all(".self_attn." not in name for name in report["layers"])

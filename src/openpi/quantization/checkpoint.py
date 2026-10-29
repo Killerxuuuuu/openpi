@@ -42,6 +42,14 @@ def save_checkpoint(model, report: dict, destination: str | Path, *, assets_sour
     state = {}
     for name, info in report["layers"].items():
         module = model.get_submodule(name)
+        if info.get("wrapper") == "cogact":
+            from openpi.quantization.cogact import deployment_buffers
+
+            for key, value in deployment_buffers(module).items():
+                state[f"{name}.{key}"] = value
+            if not info["original_bias"] and module.bias is not None:
+                state[f"{name}.added_bias"] = module.bias.detach().cpu().contiguous()
+            continue
         state[f"{name}.activation_absmax"] = module.activation_absmax.detach().cpu().contiguous()
         if isinstance(module, QuantVLALinear):
             for key in module.transform_buffer_names:
@@ -71,7 +79,10 @@ def restore_quantization(model, checkpoint_dir: str | Path) -> dict:
     """
     directory = Path(checkpoint_dir)
     report = json.loads((directory / MANIFEST).read_text(encoding="utf-8"))
-    if report.get("format_version") not in {1, 2} or report.get("implementation") != "floating_QDQ_not_packed_integer":
+    if (
+        report.get("format_version") not in {1, 2, 3}
+        or report.get("implementation") != "floating_QDQ_not_packed_integer"
+    ):
         raise ValueError("Unsupported DA-PTQ checkpoint format")
     sidecar = load_file(str(directory / SIDECAR), device="cpu")
     if hasattr(model, "config") and "model_config" in report:
@@ -79,6 +90,17 @@ def restore_quantization(model, checkpoint_dir: str | Path) -> dict:
             if getattr(model.config, key) != report["model_config"][key]:
                 raise ValueError(f"Model configuration differs from calibrated checkpoint: {key}")
     config = PTQConfig(**{"profile": "legacy", **report["config"]})
+    if report["format_version"] == 3:
+        from openpi.quantization.cogact import RECIPE
+        from openpi.quantization.cogact_primitives import SOURCE_SHA256
+        from openpi.quantization.cogact_sampling import SOURCE_SHA256 as SAMPLING_SHA256
+
+        if (
+            report.get("recipe") != RECIPE
+            or report.get("reference_source_sha256") != SOURCE_SHA256
+            or report.get("reference_sampling_sha256") != SAMPLING_SHA256
+        ):
+            raise ValueError("Calibrated CogACT recipe/reference differs from the installed implementation")
     tail_blocks = set(protected_expert_tail_blocks(dict(model.named_modules()), config.skip_last_expert_blocks))
     invalid = [
         name
@@ -95,7 +117,19 @@ def restore_quantization(model, checkpoint_dir: str | Path) -> dict:
         source = model.get_submodule(name)
         if not isinstance(source, nn.Linear) or isinstance(source, FakeQuantLinear):
             raise ValueError(f"Expected an unwrapped Linear at {name}")
-        if info.get("wrapper") == "quantvla":
+        if info.get("wrapper") == "cogact":
+            from openpi.quantization.cogact import make_linear
+            from openpi.quantization.cogact import restore_buffers
+
+            if report["format_version"] != 3:
+                raise ValueError("CogACT deployment requires a version-3 manifest")
+            replacement = make_linear(source, name, config, initialize=False)
+            restore_buffers(
+                replacement,
+                {key: sidecar[f"{name}.{key}"] for key in info["deployment_buffers"]},
+                strides=info["buffer_strides"],
+            )
+        elif info.get("wrapper") == "quantvla":
             replacement = QuantVLALinear(
                 source,
                 info["weight_bits"],

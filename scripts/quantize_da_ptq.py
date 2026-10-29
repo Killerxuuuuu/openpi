@@ -28,7 +28,7 @@ def parser():
     )
     result.add_argument("--selection-file", type=Path, help="Reuse a saved calibration_selection.json")
     result.add_argument("--device", default="cuda")
-    result.add_argument("--seed", type=int, default=0)
+    result.add_argument("--seed", type=int)
     result.add_argument("--random-seeds", nargs="+", type=int, default=[0, 1, 2])
     result.add_argument("--bf16-ratio", type=float, default=0.30)
     result.add_argument("--calibration-samples", type=int, default=512)
@@ -47,12 +47,14 @@ def parser():
     result.add_argument("--activation-percentile", type=float, default=99.9)
     result.add_argument("--activation-calibration-batches", type=int)
     result.add_argument("--quantvla-calibration-steps", type=int)
-    result.add_argument("--max-calibration-episodes-per-task", type=int, default=5)
+    result.add_argument("--max-calibration-episodes-per-task", type=int)
     result.add_argument("--rotation-block-size", type=int)
     result.add_argument("--rotation-output-block-size", type=int)
     result.add_argument("--rotation-permute", action=argparse.BooleanOptionalAction, default=True)
     result.add_argument("--row-rotation", choices=["restore", "off"], default="restore")
     result.add_argument("--rotation-device", choices=["auto", "cpu", "cuda"], default="auto")
+    result.add_argument("--rotation-cache-enabled", action=argparse.BooleanOptionalAction, default=True)
+    result.add_argument("--rotation-cache-dir", default=".cache/cogact_reference_v3")
     result.add_argument("--quantvla-smoothing", type=float, default=0.15)
     result.add_argument("--weight-scale-mode", choices=["mse", "rtn"], default="mse")
     result.add_argument("--atm-enabled", action=argparse.BooleanOptionalAction, default=True)
@@ -67,16 +69,31 @@ def parser():
     result.add_argument("--control-weight", type=float, default=0.15)
     result.add_argument("--sensitivity-gain", type=float, default=1.6)
     result.add_argument("--physical-link-lengths", default="0.35,0.30,0.25,0.20,0.15,0.10,0.08")
+    result.add_argument("--action-timestep", type=int, default=0)
     result.add_argument("--csrc-rank", type=int, default=8)
+    result.add_argument("--csrc-method", choices=["affine", "dense"], default="affine")
+    result.add_argument("--csrc-group-size", type=int, default=32)
+    result.add_argument("--csrc-group-shrink", type=float, default=0.55)
+    result.add_argument("--csrc-shift-max", type=float, default=3.0)
+    result.add_argument("--csrc-dense-ridge", type=float, default=1e-4)
+    result.add_argument("--csrc-dense-min-eig", type=float, default=1e-6)
+    result.add_argument("--csrc-dense-weight-gain", type=float, default=1.0)
+    result.add_argument("--csrc-dense-solver-rcond", type=float, default=1e-3)
+    result.add_argument(
+        "--csrc-dense-structure", choices=["full", "blockdiag", "lowrank", "blockdiag_lowrank"], default="lowrank"
+    )
+    result.add_argument("--csrc-dense-block-size", type=int, default=64)
+    result.add_argument("--csrc-dense-delta-clip", type=float, default=0.25)
+    result.add_argument("--csrc-bypass-enabled", action=argparse.BooleanOptionalAction, default=False)
     result.add_argument("--csrc-feature-weight", type=float, default=1.0)
     result.add_argument("--csrc-identity-weight", type=float, default=8.0)
     result.add_argument("--csrc-max-iter", type=int, default=64)
-    result.add_argument("--csrc-max-dim", type=int, default=1024)
+    result.add_argument("--csrc-max-dim", type=int)
     result.add_argument("--csrc-scale-min", type=float, default=0.5)
     result.add_argument("--csrc-scale-max", type=float, default=2.0)
     result.add_argument("--no-csrc", action="store_true", help="Optional DA-MPA-only ablation")
     result.add_argument("--quant-regex", help="Override explicit module selection; full match")
-    result.add_argument("--rank-regex", help="Override equal-cost MLP ranking candidates; full match")
+    result.add_argument("--rank-regex", help="Override MLP ranking candidates; full match")
     result.add_argument("--csrc-regex", help="Override legal compensation projections; full match")
     result.add_argument("--unbalanced-sampling", action="store_true")
     result.add_argument(
@@ -112,6 +129,9 @@ def configurations(args):
 def main(argv=None):
     args = parser().parse_args(argv)
     jobs = configurations(args)
+    # Resolve profile defaults before these values are used by data sampling.
+    args.seed = jobs[0][1].seed
+    args.max_calibration_episodes_per_task = jobs[0][1].max_calibration_episodes_per_task
     if args.dry_run:
         print(json.dumps({name: config.to_dict() for name, config in jobs}, indent=2))
         return
@@ -162,6 +182,8 @@ def main(argv=None):
         spatial_bins=args.spatial_bins,
         spatial_warmup_samples=args.spatial_warmup_samples,
         max_episodes_per_task=args.max_calibration_episodes_per_task if args.profile != "legacy" else 0,
+        sampling_recipe="cogact" if args.profile == "cogact" else "workspace_xyz",
+        action_timestep=jobs[0][1].action_timestep,
     )
     selection_path = args.output_dir / "calibration_selection.json"
     if selection_path.exists():

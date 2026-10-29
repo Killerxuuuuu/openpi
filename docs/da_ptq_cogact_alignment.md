@@ -1,124 +1,212 @@
-# CogACT / openpi Implementation Audit and Partial Alignment
+# CogACT Numerical Alignment for π₀.₅ / LIBERO
 
-Date: 2026-10-29. Reference: the local `DA-PTQ/vla/quantvla_ptq.py`, `DA-PTQ/scripts/quantize_quantvla.py`, and `DA-PTQ/README.md`. This is a comparison of executable local code, not a reconstruction of historical paper results.
+Updated: 2026-10-29. Recipe: `cogact_reference_v3`, checkpoint format 3.
 
-## Main finding
+This replaces the earlier **partial** `cogact` profile. Use `--profile cogact`
+explicitly. Historical `quantvla` and `legacy` algorithms remain available.
+The runner rejects old calibration recipes: start from the original weights in
+a new output directory. Original CogACT source files were not modified.
 
-The CogACT LLM wrapper explicitly excludes Q/K/V/O projections (`apply_quantvla_wrappers_to_llm`), despite its include-regex and comment mentioning attention. The earlier openpi `quantvla` profile quantized these language projections at W2. This is a substantial experimental difference and a plausible contributor to the observed collapse. It is not yet a demonstrated cause: only server evaluation can establish whether the new layout improves success.
+## Implementation and provenance
 
-`--profile cogact` now provides a separate, partially aligned configuration. The existing `quantvla` and `legacy` profiles remain explicit and loadable when they satisfy the mandatory expert-tail guard. Do not mix their calibration artifacts or results with the new profile.
+`cogact_primitives.py` contains dependency-closed, **unmodified definitions** from
+the local `DA-PTQ/vla/quantvla_ptq.py`. `cogact_sampling.py` contains the original
+action-XY quota sampler from `DA-PTQ/scripts/quantize_quantvla.py`.
+`scripts/sync_cogact_primitives.py` regenerates both modules with source hashes.
+The server needs neither the sibling checkout nor Prismatic. Do not edit these
+generated definitions by hand. The π₀.₅ interface is implemented in `cogact.py`.
 
-## Code comparison
+| Component | Revision-3 behavior |
+| --- | --- |
+| Quantized modules | Language and eligible action-expert MLP projections; language/expert Q/K/V/O excluded from W/A QDQ |
+| Fixed boundaries | First expert block eligible by default; at least the final two complete expert blocks always bypass W/A QDQ |
+| Rotations | Original SVD, zigzag permutation, source-dtype matrices/operations, blocks 16/16, output restore, smoothing 0.15 |
+| Rotation cache | Original weight/config-validated cache reused across calibration variants; saved deployment buffers do not depend on the cache |
+| Bias convention | Original reference restore-mode bias behavior retained; no silent correction of the source algorithm |
+| Weight masters | Original CPU `weight_master`/`bias_master`; adaptive assignment and compensation requantize from masters |
+| General weight QDQ | Original per-output-channel RTN or MSE |
+| Adaptive weight QDQ | Original per-output-row RTN, even when general mode is MSE |
+| Sensitivity probe | W-QDQ student, A quantization off, per-batch structural weights, seed `calibration_seed + 200000 + step` |
+| Allocation | Global output channels, rounded-up target, original `score >= kth_threshold` tie behavior |
+| Fallback | W16 rows retain A8; excluded modules retain original floating precision |
+| Activation observer | Original percentile/QDQ implementation, 99.9th percentile, 64 calls, first 4096 rows/call |
+| Unobserved A scale | Original dynamic absmax fallback until channel scales are observed |
+| Structural prior | Original seven virtual links and per-batch formula |
+| Attention statistics | Mean of per-sample population standard deviations, averaged over calls; mean of per-call output RMS |
+| ATM | Original clipping `[0.5,2]` and neutral threshold 0.02 |
+| OHB | Original log-clipped teacher/student ratio; **inverse beta** folded into O and its bias |
+| CSRC | Original grouped affine or weighted identity-prior dense solver, original matrix orientation and folding; no quartic/LBFGS fit |
+| Stage order | Teacher → W-QDQ wrappers → student probe → channel assignment → student statistics with A observation/QDQ → ATM/OHB from the same statistics → CSRC → final activation-only calibration |
+| Sampling | Original action-XY quota/warmup/fallback algorithm on a seeded LeRobot stream; task balancing and first-five-episode restriction removed by default |
+| Seed | 3407 by default |
+| Deployment | Weights, channel assignments, SVD buffers/strides, A scales, biases and optional bypass buffers saved; inference does not recalibrate or re-QDQ |
 
-| Component | Local CogACT code / README recipe | Earlier openpi `quantvla` profile | New openpi `cogact` profile |
-| --- | --- | --- | --- |
-| Precision | W4A8 recipe | W2A8 experiment | Configurable; validate W4A8 first, then test W2A8 |
-| Language Q/K/V/O | Excluded by the actual wrapper predicate | Quantized | Excluded from W/A QDQ |
-| Expert attention | Floating | Floating | Floating |
-| Expert boundaries | README: first 0, last 2 MLP blocks; dataclass: first 1, last 2 | First 1, last 2 | First 0 by default; final 2 complete blocks always protected |
-| Input/output rotation block | README: 16/16, both rotations enabled, restore output | 64/64 | 16/16, both rotations enabled, restore output |
-| Activation scale | Signed per-input-channel, 99.9th percentile, first 64 observed calls, at most 4096 rows/call | First 32 calls, no 4096-row cap | 64 calls and the same 4096-row cap |
-| Non-adaptive weight QDQ | Per-output-channel RTN or MSE, with scales `base / [0.5,0.75,1,1.25,1.5]` | Same reciprocal MSE grid | Same shared formula; parity-tested against the local source |
-| Sensitivity-adaptive weight path | Per-output-row RTN, even when the general mode is MSE | Per-whole-layer MSE | Whole-layer path retained; not the CogACT adaptive-row RTN path |
-| High-bit fallback | W16 rows retain A8 | W16A16 layers | W16A8 layers by default; fixed protected blocks bypass both W/A QDQ |
-| Statistical matching budget | Full calibration pass; README requests 512 batches | At most 128 batches | Full configured frame/batch pass by default (512 batches for 512 frames, batch size 1) |
-| Structural surrogate | Seven virtual segments with link lengths `0.35,0.30,0.25,0.20,0.15,0.10,0.08`; per-batch weights | Six equal planar segments plus generic channel; dataset-average weights | Local seven-segment formula and per-batch loss weights, parity-tested |
-| Surrogate gain | Clip `1 + gain * (normalized_score - 1)` to `[0.05,20]`, no subsequent mean normalization | Additional mean normalization after gain | Matches the local gain behavior |
-| Allocation unit | Global output-channel ranking; different row widths can imply different parameter costs | Equal-cost whole linear layers | Equal-cost whole layers retained for the existing rebuttal controls |
-| Sensitivity probe model | Already W-QDQ-wrapped student, A quantization disabled | Full-precision teacher | Full-precision teacher retained; not an exact CogACT ranking reproduction |
-| ATM clipping | Ratio clipped to `[0.5,2]`, linear neutrality threshold 0.02 | Log clamp 0.30, log neutrality 0.03 | Ratio clipped to `[0.5,2]`, linear neutrality 0.02 |
-| ATM folding | Multiply fused Q and K by `sqrt(alpha)` | Scale expert Q only | Scale Q only: pi0.5 uses GQA and shared prefix keys, so scaling expert K alone would miss prefix-key logits |
-| OHB direction | Computes teacher/student RMS, then folds **inverse beta** into O | Folds **beta** into O | Retains multiplication toward the teacher; does not copy the inverse-beta behavior |
-| Attention statistic aggregation | Mean of per-call standard deviations/RMS | Pooled moments over captured calls | Pooled moments retained |
-| Compensation target | Separate condition projection `action_model.net.z_embedder.linear` | Quantized prefix K/V before RoPE/cache | Floating prefix K/V before RoPE/cache; compensates input drift from quantized language MLPs |
-| Compensation solver | Optional grouped affine or optional dense linear-system solver | Dense quartic covariance fit using LBFGS, followed by rank truncation | Existing covariance solver retained and explicitly recorded; not identical to either local solver |
-| Actual compensation enablement | README defaults affine/dense to false; entrypoint forcibly disables dense compensation and its FP16 bypass | CSRC enabled for the three allocation strategies | CSRC remains enabled for the requested controls; it is not silently disabled to match a local entrypoint default |
-| Rotation numerics | SVD bases, usually stored/operated in source dtype | Covariance-eigh bases and FP32 rotation math | Existing eigh/FP32 path retained; floating equivalence is tested, but basis signs and low-bit outputs need not match SVD bit-for-bit |
-| Loss and conditioning | Diffusion epsilon prediction with a separate action-conditioning interface | pi0.5 flow matching with joint/cached attention | pi0.5 architecture and flow target retained |
+### Budget interpretation
 
-The retained differences are intentional and visible. In particular, this profile does **not** claim that channel ranking and layer ranking are equivalent, that the two compensation solvers solve the same objective, or that the historical CogACT paper results are reproduced. No original CogACT algorithm code was changed by this audit.
+30% now means **output channels**, as in CogACT, rather than whole Linear layers.
+Threshold ties can retain more than the target. Rows have different parameter
+costs when their input widths differ: this is **not an exact equal-parameter
+budget**. Random controls use distinct shuffled priorities and select exactly
+the rounded-up target. Inspect `channel_allocation`, `high_precision_channels`
+and `high_parameter_fraction`; do not reuse the previous whole-layer-budget claim.
 
-## Why floating K/V still receives compensation
+### CSRC enablement and parameters
 
-Protecting a K/V projection from QDQ does not prevent its inputs from changing when preceding language MLPs are quantized. The new profile collects teacher/student moments at these floating projections and folds the fitted affine correction into their floating weights and bias. It does not wrap them in A8/W2 again. Any added fused biases are serialized separately and restored without introducing a low-rank inference branch.
+The local CogACT entrypoint defaults affine compensation to **off** and forcibly
+disables dense compensation and its FP16 bypass. The requested compensated
+controls explicitly enable compensation; this is an experiment choice.
+
+- `--csrc-method affine` uses the original grouped moment correction. Defaults
+  follow the README's optional affine recipe: group size 32, shrink 0.55, scales
+  `[0.5,2]`, shift limit 3 teacher standard deviations, neutrality 0.02.
+- `--csrc-method dense` explicitly enables the original dense function that the
+  local entrypoint otherwise disables. Defaults: ridge `1e-4`, min eigenvalue
+  `1e-6`, weight gain 1, feature weight 1, identity weight 8, solver fallback
+  `rcond=1e-3`, low-rank structure, rank 8, delta clip 0.25.
+- `--csrc-bypass-enabled` enables the source's optional bypass for PTQLinear
+  targets. Ordinary floating targets use direct folding. Default: off.
+- `--no-csrc` matches the source entrypoint's default compensation enablement.
+
+Historical `--csrc-max-iter` is an LBFGS option and does not govern these solvers.
+Use separate output roots for affine, dense, and no-compensation experiments.
+
+## Necessary model and experiment interfaces
+
+Numerical alignment does not make CogACT and π₀.₅ identical models:
+
+1. π₀.₅ predicts flow velocity and uses shared prefix K/V; CogACT predicts
+   diffusion noise and has a separate `z_embedder.linear`. CSRC therefore targets
+   floating prefix K/V before RoPE/cache insertion. Biasless π₀.₅ targets receive
+   an exactly zero bias before teacher collection, allowing the unchanged
+   folding routine to represent shifts. Added biases are saved and restored.
+2. π₀.₅ has GQA and keys shared with language queries. Expert Q is multiplied by
+   alpha, giving the same per-head logit multiplier as Q and repeated K each
+   multiplied by `sqrt(alpha)`, including prefix keys. Shared language queries
+   are unaffected. Weight tensors and BF16 rounding are not bit-identical to
+   CogACT's fused Q/K/V. Masked π₀.₅ attention entries are excluded from statistics.
+3. LIBERO/LeRobot, original π₀.₅ normalization and the action horizon replace
+   Bridge/RLDS. The action-XY quota algorithm is identical, but the data stream
+   differs. Calibration samples are frames with action chunks, not rollouts.
+4. W2A8, 30% W16 fallback and compensation enablement are explicit experiment
+   settings. The local README example uses W4A8. Matching code does not imply
+   that W2A8 will recover a published success rate.
 
 ## Validation
 
-- CPU tests import the actual local CogACT reference file and compare W2/W4/W8 RTN/MSE QDQ, percentile observers (including the 4096-row cap), and the per-batch structural weighting formula.
-- Tiny models exercise the actual openpi joint-attention control flow, gradients, mixed allocation, floating-K/V compensation, export and exact reload for the old and new profiles.
-- The tests are numerical and implementation checks. They do not establish full-checkpoint accuracy, LIBERO success, native INT2 execution, or GPU latency.
-- Tests that require the separate local CogACT checkout are skipped if that reference file is absent, such as in a standalone openpi checkout.
+CPU tests check the copied definitions against the actual source AST, FP32/BF16
+rotated and mixed-bit forwards, both compensation solvers and master-weight
+folding, threshold ties, inverse OHB, per-call statistics and the original sampler.
+Tiny models exercise actual joint-Gemma flow control, all allocation modes, both
+CSRC choices, fixed tail protection and exact export/reload. Tests reject old
+calibration recipes. Source-comparison tests skip if the separate reference
+checkout is absent. Full-checkpoint LIBERO success and GPU performance still
+require server evaluation.
 
-## Server instructions: fresh calibration required
+## Server commands: calibration and evaluation separately
 
-Update the fork on the server first. Keep the existing CPython/torch-cu128/Transformers patch and separate LIBERO environment. Use fresh commands rather than the old `COMMON` array: its explicit block=64, first-block=1, or fallback-A16 arguments would override the new defaults.
+Update the server checkout first. Keep the existing cu128/Transformers patch;
+do not run `uv sync`. These commands use **GPU 3**, one calibration process and
+at most two evaluation models. Stop older GPU-3 launchers before starting;
+the worker limit cannot constrain another launcher.
+
+### Shared environment and arguments
 
 ```bash
 cd /home/xusiyuan/openpi
 export PTQ_DATA_ROOT=/data2/xusiyuan
-export JAX_PLATFORMS=cpu
-export XLA_PYTHON_CLIENT_PREALLOCATE=false
-
-# Inspect the resolved new settings without loading a model.
-.venv/bin/python scripts/quantize_da_ptq.py \
-  --checkpoint-dir "$PTQ_DATA_ROOT/checkpoints/pi05_libero_pytorch" \
-  --dataset-root "$PTQ_DATA_ROOT/datasets/physical-intelligence/libero" \
-  --output-dir "$PTQ_DATA_ROOT/runs/cogact_layout_w4a8" \
-  --profile cogact --weight-bits 4 --mode da_ptq --dry-run
-
-# First validate the shared path at the local CogACT recipe's W4A8 precision.
-CUDA_VISIBLE_DEVICES=6 .venv/bin/python -u scripts/quantize_da_ptq.py \
-  --checkpoint-dir "$PTQ_DATA_ROOT/checkpoints/pi05_libero_pytorch" \
-  --dataset-root "$PTQ_DATA_ROOT/datasets/physical-intelligence/libero" \
-  --output-dir "$PTQ_DATA_ROOT/runs/cogact_layout_w4a8" \
-  --profile cogact --weight-bits 4 --mode da_ptq --device cuda:0
-```
-
-After calibration, use the existing LIBERO CPU-rendering environment:
-
-```bash
-conda activate libero-cpython
-export LIBERO_PYTHON="$CONDA_PREFIX/bin/python"
-export LD_LIBRARY_PATH="$CONDA_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export RUNS="$PTQ_DATA_ROOT/runs/cogact_reference_v3_w2a8_20261029"
+export LIBERO_ENV=/home/xusiyuan/.conda/envs/libero-cpython
+export LIBERO_PYTHON="$LIBERO_ENV/bin/python"
+export LD_LIBRARY_PATH="$LIBERO_ENV/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export LIBERO_CONFIG_PATH="$PWD/.libero_config"
-export MUJOCO_GL=osmesa
-export PYOPENGL_PLATFORM=osmesa
-export LIBGL_ALWAYS_SOFTWARE=1
-export LP_NUM_THREADS=8
-export OMP_NUM_THREADS=2
+export MUJOCO_GL=osmesa PYOPENGL_PLATFORM=osmesa LIBGL_ALWAYS_SOFTWARE=1
+export LP_NUM_THREADS=8 OMP_NUM_THREADS=2
+export JAX_PLATFORMS=cpu XLA_PYTHON_CLIENT_PREALLOCATE=false
+export CUDA_DEVICE_ORDER=PCI_BUS_ID
 export PYTHONPATH="$PWD/src:$PWD/packages/openpi-client/src${PYTHONPATH:+:$PYTHONPATH}"
+unset MUJOCO_EGL_DEVICE_ID
+mkdir -p "$RUNS/logs"
 
-CUDA_VISIBLE_DEVICES=6 .venv/bin/python scripts/evaluate_da_ptq_matrix.py \
-  --runs-dir "$PTQ_DATA_ROOT/runs/cogact_layout_w4a8" \
-  --output-dir "$PTQ_DATA_ROOT/runs/cogact_layout_w4a8/spatial_smoke" \
-  --variants da_ptq \
-  --bf16-checkpoint "$PTQ_DATA_ROOT/checkpoints/pi05_libero_pytorch" \
-  --eval-python "$LIBERO_PYTHON" --suites libero_spatial \
-  --num-trials 1 --seeds 7 --port 2914 --device cuda:0 \
-  --save-video --video-max-trials 1
+COMMON=(
+  --checkpoint-dir "$PTQ_DATA_ROOT/checkpoints/pi05_libero_pytorch"
+  --dataset-root "$PTQ_DATA_ROOT/datasets/physical-intelligence/libero"
+  --output-dir "$RUNS"
+  --profile cogact --weight-bits 2 --activation-bits 8
+  --weight-scale-mode mse --bf16-ratio 0.30 --fallback-activation-bits 8
+  --skip-first-expert-blocks 0 --skip-last-expert-blocks 2
+  --calibration-samples 512 --batch-size 1 --probe-steps 16 --seed 3407
+  --max-calibration-episodes-per-task 0
+  --rotation-block-size 16 --rotation-output-block-size 16
+  --activation-percentile 99.9 --activation-calibration-batches 64
+  --quantvla-calibration-steps 512 --matching-neutral-band 0.02
+  --csrc-method dense --csrc-group-size 32 --csrc-group-shrink 0.55
+)
 ```
 
-If W4A8 also fails while BF16 succeeds, stop and inspect the common quantization/compensation path rather than running a full experiment. W4A8 success would narrow the investigation but would not establish that W2A8 works.
+To use the source dense solver, change `affine` to `dense` and choose another
+new root before calibration. For W4A8 diagnostics, change weight bits to 4 and
+also choose another root. Recreate the same `COMMON` array in a new terminal.
 
-Once the shared path has been validated, calibrate the requested W2A8 controls into another new directory:
+### Calibration
 
 ```bash
-export RUNS="$PTQ_DATA_ROOT/runs/cogact_layout_w2a8_controls"
-.venv/bin/python -u scripts/run_da_ptq_controls.py \
-  --checkpoint-dir "$PTQ_DATA_ROOT/checkpoints/pi05_libero_pytorch" \
-  --dataset-root "$PTQ_DATA_ROOT/datasets/physical-intelligence/libero" \
-  --output-dir "$RUNS" --profile cogact --weight-bits 2 \
-  --gpus 6 7 --workers-per-gpu 1 --stage calibrate
+."${COMMON[@]}" --gpus 3 --workers-per-gpu 1 --stage calibrate --dry-run
 
-# Check W2A8 before scheduling the formal run; each GPU hosts at most two models.
-.venv/bin/python -u scripts/run_da_ptq_controls.py \
-  --checkpoint-dir "$PTQ_DATA_ROOT/checkpoints/pi05_libero_pytorch" \
-  --dataset-root "$PTQ_DATA_ROOT/datasets/physical-intelligence/libero" \
-  --output-dir "$RUNS" --profile cogact --weight-bits 2 \
-  --eval-python "$LIBERO_PYTHON" --gpus 6 7 --workers-per-gpu 2 \
-  --stage evaluate --split-suites --include-bf16 \
-  --suites libero_spatial --num-trials 1 --seeds 7 --base-port 2920 \
-  --save-video --video-max-trials 1
+CALvenv/bin/python scripts/run_da_ptq_controls.py \
+  _LOG="$RUNS/logs/calibrate_$(date +%Y%m%d_%H%M%S).log"
+nohup .venv/bin/python -u scripts/run_da_ptq_controls.py \
+  "${COMMON[@]}" --gpus 3 --workers-per-gpu 1 --stage calibrate \
+  > "$CAL_LOG" 2>&1 < /dev/null &
+echo "Calibration PID: $!"
+echo "Calibration log: $CAL_LOG"
 ```
 
-Only after the W2A8 checks pass, use the same final command with all four suites, `--num-trials 50`, and `--video-max-trials 2`. Reuse the **new** calibration artifacts and the **same profile**. Keep old all-zero runs for diagnosis; do not merge them into a successful run or present this change as a verified recovery before measurement.
+The runner prints `calibration_*/`; per-worker details are in its `gpu3.log`.
+Completed artifacts are in `$RUNS/quantized/<variant>/`. Each variant fits its own
+correction using the same selected frames. Compatible completed artifacts are
+reused; old/incompatible artifacts are rejected.
+The source computes full SVDs, so the first wrapping pass can be slow. Per-layer
+W-QDQ/SVD progress and cache hits are logged. The default cache is
+`.cache/cogact_reference_v3`; keep it between variants. `--no-rotation-cache-enabled`
+disables it, and `--rotation-cache-dir` selects another location.
+
+### Evaluation
+
+After calibration completes, first run a Spatial diagnostic:
+
+```bash
+SMOKE_LOG="$RUNS/logs/spatial_smoke_$(date +%Y%m%d_%H%M%S).log"
+nohup .venv/bin/python -u scripts/run_da_ptq_controls.py \
+  "${COMMON[@]}" --stage evaluate --gpus 3 --workers-per-gpu 2 --split-suites \
+  --eval-python "$LIBERO_PYTHON" --base-port 2914 \
+  --variants da_ptq equal_weight random_seed_0 --include-bf16 \
+  --suites libero_spatial --num-trials 1 --seeds 7 \
+  --save-video --video-max-trials 1 \
+  > "$SMOKE_LOG" 2>&1 < /dev/null &
+echo "Smoke PID: $!"
+echo "Smoke log: $SMOKE_LOG"
+```
+
+Inspect outcomes and videos. If BF16 succeeds while quantized variants still
+consistently fail, investigate before scheduling 50 trials/task. After the
+diagnostic finishes and passes, run the formal evaluation:
+
+```bash
+FORMAL_LOG="$RUNS/logs/formal_$(date +%Y%m%d_%H%M%S).log"
+nohup .venv/bin/python -u scripts/run_da_ptq_controls.py \
+  "${COMMON[@]}" --stage evaluate --gpus 3 --workers-per-gpu 2 --split-suites \
+  --eval-python "$LIBERO_PYTHON" --base-port 2914 \
+  --variants da_ptq equal_weight random_seed_0 random_seed_1 random_seed_2 \
+  --include-bf16 --suites libero_spatial libero_object libero_goal libero_10 \
+  --num-trials 50 --seeds 7 --save-video --video-max-trials 2 \
+  > "$FORMAL_LOG" 2>&1 < /dev/null &
+echo "Formal PID: $!"
+echo "Formal log: $FORMAL_LOG"
+```
+
+Do not overlap smoke and formal launchers. Formal evaluation is 2,000
+episodes/model, 12,000 across BF16 and five quantized models. Each evaluation gets
+a fresh directory. Success rates and paired NPZ traces are produced together;
+no second evaluation is needed for trajectory deviation. Read
+`evaluation_*/results.json`; worker logs, per-suite summaries, traces and selected
+videos are under that invocation.

@@ -88,7 +88,11 @@ def select_modules(model: nn.Module, config: PTQConfig):
         raise ValueError("quant_regex matched no eligible Linear modules. Inspect the model module names.")
     if config.mode not in {"uniform", "quantvla"} and not rank:
         raise ValueError("rank_regex matched no eligible layers after protecting the last expert blocks.")
-    if config.mode not in {"uniform", "quantvla"} and len({module.weight.numel() for module in rank.values()}) != 1:
+    if (
+        config.profile != "cogact"
+        and config.mode not in {"uniform", "quantvla"}
+        and len({module.weight.numel() for module in rank.values()}) != 1
+    ):
         raise ValueError(
             "Ranking candidates must have equal weight cost for exact same-budget controls. "
             "Restrict rank_regex to equal-cost projections."
@@ -206,10 +210,15 @@ def _sync(model):
 def calibrate(model: nn.Module, batches: BatchFactory, config: PTQConfig) -> dict:
     """Calibrate an in-memory model. Only the CSRC matrix is optimized offline.
 
-    All policies, including controls, profile the same full-precision teacher.
-    No optimizer updates the pretrained policy; gradients only determine ranking.
+    Historical profiles probe the full-precision teacher; the CogACT recipe
+    probes the W-QDQ student through its own stage orchestrator.
+    No optimizer fine-tunes policy weights; gradients only determine ranking.
     The returned report is also the deployment reconstruction manifest.
     """
+    if config.profile == "cogact":
+        from openpi.quantization.cogact import calibrate_cogact
+
+        return calibrate_cogact(model, batches, config)
     quant, candidates, csrc, protected = select_modules(model, config)
     original_state_keys = list(model.state_dict())
     initial_training = model.training

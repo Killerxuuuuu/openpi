@@ -40,12 +40,14 @@ class PTQConfig:
     activation_percentile: float = 99.9
     activation_calibration_batches: int | None = None
     quantvla_calibration_steps: int | None = None
-    max_calibration_episodes_per_task: int = 5
+    max_calibration_episodes_per_task: int | None = None
     rotation_block_size: int | None = None
     rotation_output_block_size: int | None = None
     rotation_permute: bool = True
     row_rotation: Literal["restore", "off"] = "restore"
     rotation_device: Literal["auto", "cpu", "cuda"] = "auto"
+    rotation_cache_enabled: bool = True
+    rotation_cache_dir: str = ".cache/cogact_reference_v3"
     quantvla_smoothing: float = 0.15
     weight_scale_mode: Literal["mse", "rtn"] = "mse"
     atm_enabled: bool = True
@@ -60,7 +62,7 @@ class PTQConfig:
     physical_link_lengths: str = "0.35,0.30,0.25,0.20,0.15,0.10,0.08"
     action_dims: int = 7
     action_timestep: int = 0
-    seed: int = 0
+    seed: int | None = None
     allocation_seed: int = 0
     quant_regex: str = (
         rf"(?:{TEXT}|{EXPERT})\.(?:self_attn\.(?:q_proj|k_proj|v_proj|o_proj)"
@@ -71,13 +73,28 @@ class PTQConfig:
     # widths are small; compensation never crosses RoPE, norms, or residuals.
     csrc_regex: str = rf"{TEXT}\.self_attn\.(?:k_proj|v_proj)$"
     csrc_enabled: bool = True
+    # Revision 3 uses the vendored CogACT primitives and channel allocation.
+    # Earlier cogact artifacts remain deployable, but cannot satisfy this recipe.
+    cogact_revision: int = 3
+    csrc_method: Literal["affine", "dense"] = "affine"
+    csrc_group_size: int = 32
+    csrc_group_shrink: float = 0.55
+    csrc_shift_max: float = 3.0
+    csrc_dense_ridge: float = 1e-4
+    csrc_dense_min_eig: float = 1e-6
+    csrc_dense_weight_gain: float = 1.0
+    csrc_dense_solver_rcond: float = 1e-3
+    csrc_dense_structure: Literal["full", "blockdiag", "lowrank", "blockdiag_lowrank"] = "lowrank"
+    csrc_dense_block_size: int = 64
+    csrc_dense_delta_clip: float = 0.25
+    csrc_bypass_enabled: bool = False
     csrc_rank: int = 8
     csrc_feature_weight: float = 1.0
     csrc_identity_weight: float = 8.0
     csrc_scale_min: float = 0.5
     csrc_scale_max: float = 2.0
     csrc_max_iter: int = 64
-    csrc_max_dim: int = 1024
+    csrc_max_dim: int | None = None
     csrc_tolerance: float = 1e-7
     max_tokens_per_call: int = 1024
     eps: float = 1e-6
@@ -93,6 +110,9 @@ class PTQConfig:
                 math.ceil(self.calibration_samples / max(1, self.batch_size)) if self.profile == "cogact" else 128
             ),
             "matching_neutral_band": 0.02 if self.profile == "cogact" else 0.03,
+            "seed": 3407 if self.profile == "cogact" else 0,
+            "max_calibration_episodes_per_task": 0 if self.profile == "cogact" else 5,
+            "csrc_max_dim": 2048 if self.profile == "cogact" else 1024,
         }.items():
             if getattr(self, key) is None:
                 object.__setattr__(self, key, value)
@@ -120,6 +140,8 @@ class PTQConfig:
             "quantvla_calibration_steps",
             "rotation_block_size",
             "rotation_output_block_size",
+            "csrc_group_size",
+            "csrc_dense_block_size",
         ):
             if getattr(self, key) < 1:
                 raise ValueError(f"{key} must be positive")
@@ -129,6 +151,8 @@ class PTQConfig:
             raise ValueError("Episode limit must be nonnegative (0 means unlimited)")
         if self.fallback_activation_bits not in {8, 16}:
             raise ValueError("Fallback activation precision must be 8 or 16")
+        if self.profile == "cogact" and self.fallback_activation_bits != self.activation_bits:
+            raise ValueError("CogACT channel fallback retains the same activation bits as low-bit rows")
         if not 0 < self.activation_percentile <= 100:
             raise ValueError("Activation percentile must be in (0, 100]")
         if not 0 <= self.quantvla_smoothing <= 1:
@@ -137,6 +161,19 @@ class PTQConfig:
             raise ValueError("Invalid rotation mode/device")
         if self.weight_scale_mode not in {"mse", "rtn"}:
             raise ValueError("Unknown weight scale mode")
+        if self.csrc_method not in {"affine", "dense"} or self.csrc_dense_structure not in {
+            "full",
+            "blockdiag",
+            "lowrank",
+            "blockdiag_lowrank",
+        }:
+            raise ValueError("Unknown CogACT compensation method/structure")
+        if not 0 <= self.csrc_group_shrink <= 1:
+            raise ValueError("csrc_group_shrink must be in [0, 1]")
+        if self.csrc_bypass_enabled and (self.profile != "cogact" or self.csrc_method != "dense"):
+            raise ValueError("The optional CogACT bypass requires --profile cogact --csrc-method dense")
+        if self.profile == "cogact" and self.cogact_revision != 3:
+            raise ValueError("Calibration requires CogACT revision 3")
         if self.action_dims != 7:
             raise ValueError("The paper's structural prior is defined for seven action dimensions.")
         if not 0 < self.csrc_scale_min <= self.csrc_scale_max:
@@ -153,6 +190,12 @@ class PTQConfig:
             "atm_log_clamp",
             "ohb_log_clamp",
             "matching_neutral_band",
+            "csrc_shift_max",
+            "csrc_dense_ridge",
+            "csrc_dense_min_eig",
+            "csrc_dense_weight_gain",
+            "csrc_dense_solver_rcond",
+            "csrc_dense_delta_clip",
         ):
             value = getattr(self, key)
             if not math.isfinite(value) or value < 0:

@@ -99,6 +99,47 @@ def test_calibration_cache_rejects_changed_budget_or_selection(runner, tmp_path)
         )
 
 
+def test_cogact_cache_requires_new_recipe_and_reference_hashes(runner, tmp_path):
+    from openpi.quantization.cogact import RECIPE
+    from openpi.quantization.cogact_primitives import SOURCE_SHA256
+    from openpi.quantization.cogact_sampling import SOURCE_SHA256 as SAMPLING_SHA256
+
+    args = arguments(runner, tmp_path, "--profile", "cogact")
+    config = runner.plans(args)["da_ptq"]
+    directory = tmp_path / "artifact"
+    directory.mkdir()
+    for filename in ("model.safetensors", "da_ptq.safetensors"):
+        (directory / filename).touch()
+    (directory / "assets").mkdir()
+    selection = {"dataset_root": str(args.dataset_root.resolve()), "indices": [1, 2]}
+    report = {
+        "format_version": 2,
+        "config": config.to_dict(),
+        "source_checkpoint": str(args.checkpoint_dir.resolve()),
+        "calibration_data": selection,
+    }
+    manifest = directory / "da_ptq.json"
+    manifest.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="Old/incompatible"):
+        runner.validate_artifact(
+            directory, config, args.checkpoint_dir.resolve(), args.dataset_root.resolve(), selection
+        )
+    report.update(
+        format_version=3,
+        recipe=RECIPE,
+        reference_source_sha256=SOURCE_SHA256,
+        reference_sampling_sha256=SAMPLING_SHA256,
+    )
+    manifest.write_text(json.dumps(report))
+    runner.validate_artifact(directory, config, args.checkpoint_dir.resolve(), args.dataset_root.resolve(), selection)
+    report["reference_source_sha256"] = "different_source"
+    manifest.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="Old/incompatible"):
+        runner.validate_artifact(
+            directory, config, args.checkpoint_dir.resolve(), args.dataset_root.resolve(), selection
+        )
+
+
 def test_runner_dry_run_loads_no_model_or_data(runner, tmp_path, capsys):
     runner.main(
         [
